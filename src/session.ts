@@ -7,7 +7,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import type { SessionEntry, SessionFile, SessionHeader, SessionMessage } from "./types.ts";
+import type { ContentBlock, SessionEntry, SessionFile, SessionHeader, SessionMessage } from "./types.ts";
 
 export class SessionParseError extends Error {
 	readonly line?: number;
@@ -151,11 +151,11 @@ export function roleOf(entry: SessionEntry): string | undefined {
 }
 
 /** Normalize `content` to an array of blocks. Strings become a single text block. */
-export function contentBlocks(message: SessionMessage | undefined): Array<Record<string, unknown>> {
+export function contentBlocks(message: SessionMessage | undefined): ContentBlock[] {
 	if (!message) return [];
 	const content = message.content;
 	if (typeof content === "string") return content ? [{ type: "text", text: content }] : [];
-	if (Array.isArray(content)) return content as Array<Record<string, unknown>>;
+	if (Array.isArray(content)) return content as ContentBlock[];
 	return [];
 }
 

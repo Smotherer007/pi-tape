@@ -608,7 +608,7 @@ function cmdDiff(args: Args): void {
 }
 
 function cmdExtension(): void {
-	const path = join(import.meta.dirname, "..", "extension", "index.ts");
+	const path = join(import.meta.dirname, "..", "extensions", "index.ts");
 	process.stdout.write(`${resolve(path)}\n`);
 	process.stdout.write(`\nLoad it with:\n  pi -e ${resolve(path)}\n`);
 }

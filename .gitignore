@@ -1,9 +1,12 @@
-# The pi packages are symlinked in for extension loading and tests.
-# They are never vendored; see the install section of the README.
+# Dependencies are installed from the lockfile, never vendored.
 node_modules/
 
-# Local captures
-*.soul
+# Project-local tape library and recordings. The global one lives in
+# ~/.pi/agent/tape/, this is the per-project override.
+.tape/
+
+# Local recordings
+*.tape
 
 # Editor and OS noise
 .DS_Store

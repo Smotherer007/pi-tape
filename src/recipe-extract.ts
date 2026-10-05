@@ -14,9 +14,9 @@
 import type { Recipe, Step, Slot, StepKind } from "./recipe-types.ts";
 import { emptyRecipe } from "./recipe-types.ts";
 import { resolveEntries } from "./tape.ts";
-import { messageOf, toolCallsOf, type SessionEntry } from "./session.ts";
+import { messageOf, toolCallsOf } from "./session.ts";
 import { analyzeCommand, renderTemplate, categorizeFile, shapeAction, tokenizeShell } from "./normalize.ts";
-import type { TapeFile } from "./types.ts";
+import type { SessionEntry, TapeFile } from "./types.ts";
 
 /** Verbs that scaffold a new project, where a trailing bare argument is its name. */
 const SCAFFOLD_VERBS = /^(npm|npx|pnpm|yarn|bun) create$|^cargo new$|^git clone$|^mkdir$|^ng new$|^vue create$/;

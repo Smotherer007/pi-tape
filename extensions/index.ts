@@ -47,9 +47,9 @@ import {
 } from "../src/recipe-store.ts";
 import type { Recipe, RecipeIndex } from "../src/recipe-types.ts";
 import { ReplayEngine } from "../src/replay.ts";
-import { parseSession, type SessionFile } from "../src/session.ts";
+import { parseSession } from "../src/session.ts";
 import { packTape, readTape, writeTape } from "../src/tape.ts";
-import type { TapeFile } from "../src/types.ts";
+import type { SessionFile, TapeFile } from "../src/types.ts";
 
 const PROVIDER = "tape";
 const STATUS_KEY = "tape";
@@ -203,6 +203,7 @@ function textResult(text: string, details: Record<string, unknown>, isError = fa
 function registerRecipeTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "tape_search",
+		label: "Search Tape Library",
 		description:
 			"Search the local recipe store for a procedure learned from past sessions. " +
 			"Local, offline and cheap: use this before searching the web or reading files.",
@@ -243,6 +244,7 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "tape_show",
+		label: "Show Recipe",
 		description: "Show one recipe from the local store: its steps, parameters and variants.",
 		parameters: Type.Object({ name: Type.String({ description: "Recipe name, or a distinctive part of it" }) }),
 		annotations: { readOnlyHint: true },
@@ -280,6 +282,7 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "tape_dub",
+		label: "Dub Recipe Variant",
 		description:
 			"Render a recipe as concrete steps with parameter values substituted. " +
 			"An enumerated parameter swaps every slot in its group at once; a free parameter accepts any value.",
@@ -324,6 +327,7 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "tape_check",
+		label: "Check Recipe Freshness",
 		description:
 			"Check whether a recipe is still valid by running its dependency validators. " +
 			"Use it when about to rely on a recipe that may be old.",
@@ -349,6 +353,7 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "tape_splice",
+		label: "Splice Tapes into Recipe",
 		description:
 			"Learn a recipe from one or more tape recordings. With several recordings of the " +
 			"same kind of task it intersects them into a skeleton plus composable parameters.",
@@ -499,7 +504,7 @@ function createReplayStream(
 
 		stream.push({ type: "start", partial: output });
 
-		const recordedBlocks = (recorded.content ?? []) as Array<Record<string, unknown>>;
+		const recordedBlocks = (recorded.content ?? []) as unknown as Array<Record<string, unknown>>;
 
 		for (const block of recordedBlocks) {
 			const index = output.content.length;

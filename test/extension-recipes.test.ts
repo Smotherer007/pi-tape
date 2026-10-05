@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
-import tape, { recipeContext, refreshIndexIfStale } from "../extension/index.ts";
+import tape, { recipeContext, refreshIndexIfStale } from "../extensions/index.ts";
 import { recordSession } from "../src/record.ts";
 import { extractRecipe } from "../src/recipe-extract.ts";
 import { intersectRecipes } from "../src/recipe-intersect.ts";

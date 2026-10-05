@@ -44,6 +44,13 @@ export interface AnalyzedToken {
 	text: string;
 	/** Set when this token was replaced; the original text. */
 	literal?: string;
+	/**
+	 * Slot name implied by the token's *position* rather than its content.
+	 * `npm install vue-router` and `npm install react-router-dom` look nothing
+	 * alike, but both are the package argument of an install command; only the
+	 * command context can know that, so normalization supplies the name.
+	 */
+	suggested?: string;
 }
 
 export interface AnalyzedSegment {

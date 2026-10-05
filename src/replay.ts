@@ -18,8 +18,8 @@
  * explain why a run diverged from its recording.
  */
 
-import type { ReplayOutcome, SessionEntry, TapeFile } from "./types.ts";
-import { messageOf, parseSession, toolCallsOf, type SessionFile } from "./session.ts";
+import type { ReplayOutcome, SessionEntry, SessionFile, TapeFile } from "./types.ts";
+import { messageOf, parseSession, toolCallsOf } from "./session.ts";
 import { hashPrefix, type HashContext } from "./hash.ts";
 import { resolveEntries } from "./tape.ts";
 

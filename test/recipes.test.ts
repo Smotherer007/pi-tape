@@ -5,6 +5,7 @@ import { analyzeCommand, categorizeFile, isNoiseCommand, normalizeCommand, rende
 import { recordSession } from "../src/record.ts";
 import { extractRecipe } from "../src/recipe-extract.ts";
 import { familyOrthogonality, intersectRecipes, lcsAlignment, lcsLength, medoid } from "../src/recipe-intersect.ts";
+import type { Recipe } from "../src/recipe-types.ts";
 import { composeRecipe, missingInputs, queryRecipes } from "../src/recipe-query.ts";
 import { parseSession } from "../src/session.ts";
 import type { TapeFile } from "../src/types.ts";
@@ -221,8 +222,8 @@ test("the intersection yields a skeleton, not a concatenation", () => {
 test("reconnaissance is left out of the skeleton", () => {
 	const withNoise = familyTapes().map((tape) => extractRecipe(tape).recipe);
 	// Prepend a reconnaissance step to one recording, then intersect.
-	const noisy = structuredClone(withNoise[0]);
-	if (noisy?.steps[0]) {
+	const noisy = structuredClone(withNoise[0] as Recipe);
+	if (noisy.steps[0]) {
 		noisy.steps.unshift({ ...noisy.steps[0], key: "bash::ls -la <*>", verb: "ls", template: "ls -la {{target}}", noise: true });
 	}
 	const result = intersectRecipes([noisy, ...withNoise.slice(1)], { name: "with noise" });
@@ -327,7 +328,7 @@ test("orthogonality is computed from the data, not assumed", () => {
 });
 
 test("intersecting a single recipe is the identity", () => {
-	const recipe = extractRecipe(recordingOf(["npm run build"], "solo").length ? recordingOf(["npm run build"], "solo") : recordingOf(["npm run build"], "solo")).recipe;
+	const recipe = extractRecipe(recordingOf(["npm run build"], "solo")).recipe;
 	const result = intersectRecipes([recipe], { name: "solo" });
 
 	assert.equal(result.sharedSteps, recipe.steps.length);

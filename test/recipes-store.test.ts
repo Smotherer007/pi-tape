@@ -291,8 +291,8 @@ function godOf(gods: Array<{ key: string; recipes: number }>, needle: string) {
 
 test("community detection separates unrelated recipes", () => {
 	const frontend = learnedFrontendRecipe();
-	const unrelatedA = extractRecipe(recordingOf(["docker build -t app .", "docker push app"], "docker-a").length ? recordingOf(["docker build -t app .", "docker push app"], "docker-a") : recordingOf(["docker build -t app ."], "docker-a")).recipe;
-	const unrelatedB = extractRecipe(recordingOf(["docker build -t other .", "docker push other"], "docker-b").length ? recordingOf(["docker build -t other .", "docker push other"], "docker-b") : recordingOf(["docker build -t other ."], "docker-b")).recipe;
+	const unrelatedA = extractRecipe(recordingOf(["docker build -t app .", "docker push app"], "docker-a")).recipe;
+	const unrelatedB = extractRecipe(recordingOf(["docker build -t other .", "docker push other"], "docker-b")).recipe;
 
 	const graph = buildRecipeGraph([frontend, unrelatedA, unrelatedB]);
 	const result = detectCommunities(graph);

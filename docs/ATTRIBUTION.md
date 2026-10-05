@@ -18,7 +18,7 @@ modelled on it:
 | PageRank by pure-JS power iteration, no numpy | `src/graph.ts`, "god steps" over procedures |
 | Greedy Louvain modularity optimisation | `src/graph.ts`, recipe families |
 | SHA256 content hashing for incremental rebuilds | `src/recipe-store.ts`, `recipeFileDigests` |
-| `before_agent_start` prompt injection of a query-first rule | `extension/index.ts`, `recipeContext` |
+| `before_agent_start` prompt injection of a query-first rule | `extensions/index.ts`, `recipeContext` |
 | Zero-dependency, no Python, no native binaries | entire project |
 
 What is **not** borrowed: the extraction layer. pi-mindplace gets exact ground truth
@@ -34,5 +34,5 @@ plain honesty both ask for it.
 
 ## Everything else
 
-Node built-ins only. No runtime dependencies. TypeScript runs directly, with no
-build step, on Node 22.6+.
+Node built-ins only, plus `typebox` for the tool schemas the extension declares.
+TypeScript runs directly, with no build step, on Node 22.18+.

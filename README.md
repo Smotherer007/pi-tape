@@ -66,22 +66,26 @@ instead of accumulating. Details in [docs/RECIPES.md](docs/RECIPES.md).
 
 ## Install
 
-Requires Node 22.6+ (native TypeScript, no build step).
+Requires Node **22.18.0+** — the first 22.x that runs TypeScript without a flag,
+which is why it is the declared floor. Node 24 and 26 are tested as well. No build
+step.
+
+As a pi package:
 
 ```bash
-git clone <this repo> ~/pi-tape
-cd ~/pi-tape
-node src/cli.ts help
-
-# make the global pi packages resolvable for the extension and the tests
-npm run link-pi
-npm test
+pi install npm:@patimweb/pi-tape
 ```
 
-Load the extension in pi:
+From a checkout:
 
 ```bash
-pi -e ~/pi-tape/extension/index.ts
+git clone https://github.com/Smotherer007/pi-tape.git ~/pi-tape
+cd ~/pi-tape
+npm install
+npm test
+
+# try it for one invocation without installing
+pi -e ~/pi-tape/extensions/index.ts
 ```
 
 ## Quickstart
@@ -215,6 +219,7 @@ A debugger that lies is worse than none, so:
 
 ```bash
 npm test                    # 96 tests, no build step
+npm run typecheck           # tsc --noEmit, clean
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library
 ```
 
@@ -229,18 +234,54 @@ src/inspect.ts          human-readable reports
 src/diff.ts             divergence between two recordings
 src/normalize.ts        actions -> normalized shapes and templates   <- heuristic
 src/recipe-types.ts     recipe schema
-src/recipe-extract.ts   one recording -> recipe                      <- heuristic
+src/recipe-extract.ts   one tape -> recipe                           <- heuristic
 src/recipe-intersect.ts LCS alignment, skeleton, slots, parameters
 src/recipe-store.ts     two-layer store, content-addressed index staleness
 src/graph.ts            PageRank and Louvain over recipes and steps
 src/recipe-query.ts     TF-IDF search under a token budget, compose
 src/freshness.ts        dependency validators: is this recipe still true
 src/cli.ts              command line interface
-extension/              the pi extension: record, playback, five recipe tools
+extensions/             the pi extension: record, playback, five recipe tools
+test/                   node:test, no framework
 ```
 
-The library has no pi dependency. Only `extension/` imports pi, which keeps
-everything above testable without starting an agent.
+The library has exactly one runtime dependency: `typebox`, which the extension
+uses to declare its tool schemas. Nothing in the library itself imports pi, so
+everything above `extensions/` is testable without starting an agent.
+
+Type checking is a separate gate from the tests on purpose: the code ran green
+while carrying type errors, and only `tsc` found them.
+
+## Releasing
+
+Two workflows, and no manual version bumps.
+
+`ci.yml` runs on every push and pull request: the test suite on Node 22.18, 24 and
+26, plus a type check. 22.18 is in the matrix because it is the version the package
+declares as its floor — a floor that is never tested is a guess.
+
+`release.yml` runs on `main` (and on `next` as a prerelease) and hands the work to
+[semantic-release](release.config.cjs): it derives the next version from the commit
+messages, publishes to npm with provenance, writes the changelog, opens the GitHub
+release, and commits the version bump back with `[skip ci]`.
+
+So commit messages are the release mechanism. `fix:` is a patch, `feat:` is a minor,
+`feat!:` or a `BREAKING CHANGE:` footer is a major.
+
+One secret is needed, per repository — GitHub does not share secrets between repos:
+
+| Secret | What it is |
+|---|---|
+| `NPM_TOKEN` | an npm automation token allowed to publish `@patimweb/*` |
+
+Add it under Settings → Secrets and variables → Actions. `GITHUB_TOKEN` is provided
+automatically.
+
+What ships is small on purpose: `files` is an allowlist, so the tarball holds the
+sources, the extension, the docs and the licence and nothing else — no tests, no
+workflows, no dev tooling. `typebox` is the only runtime dependency, which means the
+published package has no vulnerable transitive dependencies even though the dev tree
+has some from semantic-release. `npm audit --omit=dev` reports zero.
 
 ## Credits
 

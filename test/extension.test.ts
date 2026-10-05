@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 
-import tape from "../extension/index.ts";
+import tape from "../extensions/index.ts";
 import { recordSession } from "../src/record.ts";
 import { parseSession, pathToLeaf } from "../src/session.ts";
 import { readTape } from "../src/tape.ts";
