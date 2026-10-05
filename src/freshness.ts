@@ -99,8 +99,18 @@ export async function checkFreshness(recipe: Recipe, options: FreshnessOptions =
 		}
 
 		const stderr = result.stderr.trim().split("\n")[0] ?? "";
-		// A missing tool or a dead network is not evidence that the recipe is wrong.
-		const inconclusive = /ENOTFOUND|EAI_AGAIN|ETIMEDOUT|network|offline|command not found|ENOENT|EACCES/i.test(stderr);
+		// A missing tool is not evidence that the recipe is wrong, but a 404 from a
+		// registry is: the dependency it names really is gone.
+		//
+		// POSIX assigns 127 to "command not found" and 126 to "found but not
+		// executable". Shell dialects word the *message* differently — bash says
+		// "command not found", dash says "not found" — so the exit code is the
+		// signal, not the text. Matching a bare "not found" would also swallow a
+		// registry's "404 Not Found", turning real staleness into a shrug.
+		const inconclusive =
+			result.code === 127 ||
+			result.code === 126 ||
+			/ENOTFOUND|EAI_AGAIN|ETIMEDOUT|network|offline|command not found|ENOENT|EACCES/i.test(stderr);
 		outcomes.push({
 			command: validator.command,
 			describes: validator.describes,

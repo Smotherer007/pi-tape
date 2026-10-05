@@ -341,6 +341,34 @@ test("a missing checker is unknown, not stale", async () => {
 	assert.equal(report.unknownChecks.length, 1);
 });
 
+/**
+ * The exit code decides, not the message.
+ *
+ * Regression: this used to match the string "command not found", which is bash's
+ * wording. Ubuntu runners use dash, which says "not found", so the same check
+ * passed locally and failed in CI. Both shells exit 127, so that is what the
+ * classification keys on now.
+ */
+test("an absent command is unknown, but a registry 404 is stale", async () => {
+	const absent: Recipe = {
+		...learnedFrontendRecipe(),
+		// Dialect-independent simulation of a command that is not installed.
+		validators: [{ command: "exit 127", describes: "tool exists" }],
+	};
+	const absentReport = await checkFreshness(absent, { timeoutMs: 5000 });
+	assert.equal(absentReport.status, "unknown");
+	assert.equal(absentReport.validators[0]?.status, "unknown");
+
+	const gone: Recipe = {
+		...learnedFrontendRecipe(),
+		// A registry answering "404 Not Found" is a fact about the dependency. It
+		// must not be swallowed by the same rule that tolerates a missing tool.
+		validators: [{ command: "printf 'npm error 404 Not Found\\n' >&2; exit 1", describes: "package exists" }],
+	};
+	const goneReport = await checkFreshness(gone, { timeoutMs: 5000 });
+	assert.equal(goneReport.status, "stale", `expected stale, got ${goneReport.status}: ${goneReport.validators[0]?.detail}`);
+});
+
 test("a recipe with no validators is never claimed fresh", () => {
 	const recipe: Recipe = { ...learnedFrontendRecipe(), validators: [], updatedAt: "2020-01-01T00:00:00.000Z" };
 	return checkFreshness(recipe, { dryRun: true }).then((report) => {
