@@ -1,0 +1,36 @@
+{
+  "name": "pi-tape",
+  "version": "0.1.0",
+  "description": "Record pi agent sessions, play them back deterministically, and splice them into composable recipes",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "pi-tape": "./src/cli.ts"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "link-pi": "mkdir -p node_modules/@earendil-works && PI_ROOT=\"$(npm root -g)/@earendil-works/pi-coding-agent\" && ln -sfn \"$PI_ROOT\" node_modules/@earendil-works/pi-coding-agent && ln -sfn \"$PI_ROOT/node_modules/@earendil-works/pi-ai\" node_modules/@earendil-works/pi-ai && ln -sfn \"$PI_ROOT/node_modules/typebox\" node_modules/typebox && echo \"linked pi packages from $PI_ROOT\"",
+    "capture": "node src/cli.ts capture",
+    "inspect": "node src/cli.ts inspect",
+    "diff": "node src/cli.ts diff",
+    "verify": "node src/cli.ts verify",
+    "sessions": "node src/cli.ts sessions"
+  },
+  "files": [
+    "src",
+    "extension",
+    "docs",
+    "README.md"
+  ],
+  "keywords": [
+    "pi",
+    "agent",
+    "replay",
+    "debugger",
+    "determinism",
+    "tape"
+  ]
+}

@@ -1,0 +1,11 @@
+# The pi packages are symlinked in for extension loading and tests.
+# They are never vendored; see the install section of the README.
+node_modules/
+
+# Local captures
+*.soul
+
+# Editor and OS noise
+.DS_Store
+*.log
+*.tsbuildinfo
