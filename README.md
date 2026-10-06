@@ -400,9 +400,13 @@ extensions/             the pi extension: record, playback, shadow runs, seven t
 test/                   node:test, no framework
 ```
 
-The library has exactly one runtime dependency: `typebox`, which the extension
-uses to declare its tool schemas. Nothing in the library itself imports pi, so
-everything above `extensions/` is testable without starting an agent.
+The package has **no runtime dependencies**. The extension declares its tool schemas
+with `typebox`, which pi supplies to extensions, so it is a `peerDependencies` entry
+with a `"*"` range rather than a dependency: a second physical copy could bypass pi's
+extension module mapping and create duplicate registries. Nothing in the library
+imports pi, so everything outside `extensions/` is testable without starting an
+agent — and `npm audit --omit=dev` has nothing to report because there is nothing
+installed.
 
 Type checking is a separate gate from the tests on purpose: the code ran green
 while carrying type errors, and only `tsc` found them.
@@ -437,9 +441,10 @@ automatically.
 What ships is small on purpose: `files` is an allowlist, so the tarball holds the
 compiled `dist/`, the sources, the extension, the docs and the licence and nothing
 else — no tests, no workflows, no dev tooling. `dist/` is built by
-`prepublishOnly`, so publishing without compiling is not possible. `typebox` is the only runtime dependency, which means the
-published package has no vulnerable transitive dependencies even though the dev tree
-has some from semantic-release. `npm audit --omit=dev` reports zero.
+`prepublishOnly`, so publishing without compiling is not possible. `pi` is the only thing
+that supplies a dependency at runtime, which means the published package installs
+nothing of its own, even though the dev tree carries semantic-release and its
+transitive dependencies.
 
 ## Credits
 

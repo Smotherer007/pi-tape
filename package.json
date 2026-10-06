@@ -45,14 +45,15 @@
     "test:coverage": "node --experimental-test-coverage --test 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "typebox": "^1.3.35"
+  "peerDependencies": {
+    "typebox": "*"
   },
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^1.0.3",
+    "typebox": "^1.3.35",
     "@earendil-works/pi-coding-agent": "^1.0.3",
     "@semantic-release/git": "^10.0.0",
     "@types/node": "^26.5.1",
