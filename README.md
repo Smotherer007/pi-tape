@@ -39,6 +39,25 @@ Self-test
   ✓ tape is complete
 ```
 
+What that is good for, in one screen:
+
+- **The second run costs less than the first.** The agent checks the store before it
+  checks the web — a few hundred tokens, offline, and no answer from a blog post that
+  may not be true any more.
+- **A failure that happened once can be looked at twice.** Replay serves the recorded
+  answers and replaces the recorded tool calls, so nothing leaves the machine, no
+  provider is called, the original side effects do not run again, and the cost is zero.
+  Changing one tool result re-asks only the requests after it.
+- **Knowledge multiplies instead of accumulating.** Take k recordings of one task:
+  what they share is the procedure, what varied is a parameter. A framework swap then
+  carries its router with it, because the two varied together.
+- **Composition is checkable, not hoped for.** Every step says what it needs and what
+  it leaves behind, so "take part A and part B" has an answer: what is met, and what
+  is a gap — with the gap named.
+- **A tape can be handed to someone else.** Credentials are typed as gaps and
+  redacted before the file is written, and a recording states how it ended, so nobody
+  learns a procedure from a run that failed.
+
 ## Why a tape plays back exactly
 
 An LLM call is a pure function of its prefix. Hash the prefix (messages plus tool
@@ -184,6 +203,8 @@ pi-tape link dockerfile containerise deploy
 pi-tape link containerise
 # gaps — nothing in the chain provides these
 #   ✗ file Dockerfile  (needed by containerise)
+# probe before running: docker
+# left behind: image api:latest
 ```
 
 Every placeholder also says what kind of thing is missing, so a model filling it
@@ -254,12 +275,75 @@ reproducibility by shipping opinions about containers has not removed the
 dependency, it has moved it. The only thing pi-tape assumes is a POSIX shell — and
 only when you ask it to execute something.
 
-Inside pi, seven tools are registered — `tape_search`, `tape_show`, `tape_dub`,
-`tape_check`, `tape_splice`, plus `tape_plan` (what a run would need, typed gaps
-included) and `tape_segment` (cut a recipe into parts that can travel). The system
-prompt tells the agent to consult them **before** searching the web or re-reading
-files: a recipe lookup costs a few hundred tokens and no network, a web search costs
-thousands.
+## The extension
+
+One command, seven tools, one hook — and a synthetic provider while a replay is
+armed. The command is for you; the tools are for the agent.
+
+### The command
+
+| | |
+|---|---|
+| `/tape record [name] [--redact]` | write this session to a `.tape` file; `--redact` replaces credentials first |
+| `/tape play <file>` | arm deterministic replay from a recording |
+| `/tape shadow <file> --model <provider>/<model>` | replay, and ask another model the same requests |
+| `/tape regress` | what the shadow model answered differently |
+| `/tape status` | replay progress, misses, shadow progress |
+| `/tape stop` | disarm (then `/reload` to restore the real tools) |
+| `/tape library` | list the recipe store |
+| `/tape index` | rebuild the recipe graph index |
+
+### The tools, and when the agent should reach for them
+
+| Tool | The question it answers | Why not the alternative |
+|---|---|---|
+| `tape_search` | "do I already know how to do this?" | a recipe lookup measured at ~90 tokens, local and offline; a web search costs thousands and can be wrong |
+| `tape_show` | "what exactly is the procedure?" | the steps, the parameters and the open gaps, without reading the tape |
+| `tape_dub` | "what would it look like with these values?" | concrete steps, and every unfilled placeholder *typed*: secret, path, env, choice or free |
+| `tape_plan` | "what would running it take?" | the gaps to fill, what this machine has, which steps are the agent's own — and it runs nothing |
+| `tape_segment` | "where would I cut this?" | the numbered steps and their contracts, then stores the parts when asked |
+| `tape_splice` | "learn this family" | k tapes of one task → one parameterized recipe, with the failed runs kept out |
+| `tape_check` | "is this recipe still true?" | runs the dependency validators, so an old recipe is not mistaken for a fact |
+
+### The hook
+
+`before_agent_start` appends a bounded block — about 1800 characters, at most 12
+recipes — that says what is in the store and tells the agent to consult it **before**
+searching the web or re-reading files. The budget is the point: a context injection
+that grows with the store is the disease, not the cure.
+
+While replay is armed the hook stays out of the way, because a replayed run should
+follow its recording rather than be told about new knowledge.
+
+### What that buys you
+
+- **A second run is cheaper than the first.** The agent looks in the store before it
+  looks at the web: a few hundred tokens, no network, no wrong answer from a blog
+  post. The lookup cost is bounded by design, so it does not become the problem it
+  solves.
+- **Replay costs nothing and calls no provider.** Everything is served from the
+  recording, tool calls included, so the recorded side effects never run again.
+- **Forking pays only for the new branch.** Answers are keyed by request prefix, so
+  changing one tool result at turn 7 re-asks only the requests after it.
+- **A tape can be handed over.** `--redact` replaces what looks like a credential
+  before the file is written, and the recipes derived from it never carried one.
+- **The model-upgrade question gets an answer.** A shadow run serves the recording and
+  asks a different model the same requests, then reports where they differ — and
+  separates "changed what it would do" from "said it differently".
+- **What is learned is inspectable.** Recipes are plain JSON with typed gaps and
+  contracts, and they live in git next to the code they describe.
+
+### What it does not do
+
+The tools are all read-only: the agent still edits and runs things with its normal
+tools, and nothing happens behind your back. Nothing is installed or supplied — no
+container, no version manager — so a procedure's requirements are described, probed
+and refused rather than arranged.
+
+`/tape play` serves recorded answers and *replaces* recorded tool calls, so the
+original side effects do not run again; `pi-tape run --yes` is the one that executes a
+procedure, so read it before you run it. And the regression suite is the least proven
+part of the project; see [Honest limits](#honest-limits).
 
 ## Commands
 
@@ -281,6 +365,9 @@ thousands.
 | `index` | build the graph: families (Louvain), god steps (PageRank) |
 | `check <name>` | run the recipe's dependency validators |
 | `extension` | print the path for `pi -e` |
+
+Every flag is in `pi-tape help`, which is the authoritative list; the table above is
+the shape of the thing.
 
 ## The `.tape` format
 
@@ -398,6 +485,7 @@ src/freshness.ts        dependency validators: is this recipe still true
 src/cli.ts              command line interface
 extensions/             the pi extension: record, playback, shadow runs, seven tools
 test/                   node:test, no framework
+                        cli.test.ts guards the published artefact, not the code
 ```
 
 The package has **no runtime dependencies**. The extension declares its tool schemas

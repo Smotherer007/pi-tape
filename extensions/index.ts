@@ -1,14 +1,35 @@
 /**
  * pi-tape extension.
  *
- * Two modes:
+ * Three modes, one command (`/tape`), seven tools and one hook.
  *
- *   record   `/tape record [name]` writes a `.tape` save-state of this session.
+ *   record   `/tape record [name] [--redact]` writes a `.tape` save-state of this
+ *            session. `--redact` replaces credentials before the file is written,
+ *            which makes the tape shareable and marks it lossy.
  *   playback `/tape play <file>` arms deterministic replay: recorded assistant
  *            answers are served by a synthetic provider, and recorded tool results
- *            are served by overriding the recorded tools.
+ *            are served by overriding the recorded tools. While replay is armed
+ *            nothing leaves the machine and no provider is called.
+ *   shadow   `/tape shadow <file> --model <provider>/<model>` serves the recording
+ *            as usual *and* asks the named model the same requests through
+ *            ctx.modelRegistry. `/tape regress` reports where the two diverge,
+ *            separating "changed what it would do" from "said it differently". The
+ *            comparison is tested; this wiring is the least proven part of the
+ *            project, and it costs real tokens.
  *
- * While replay is armed nothing leaves the machine and no provider is called.
+ * The tools are for the agent, and they are all read-only:
+ *
+ *   tape_search   is this in the store?        tape_splice   learn a family
+ *   tape_show     what is the procedure?       tape_check    is it still true?
+ *   tape_dub      what with these values?      tape_plan     what would it take?
+ *   tape_segment  where would I cut it?
+ *
+ * The hook is the reason they get used: `before_agent_start` appends a bounded block
+ * (~1800 characters, at most 12 recipes) telling the agent to consult the store
+ * *before* searching the web or re-reading files. A recipe lookup measured at ~90
+ * tokens against a web search that costs thousands is the whole argument. While
+ * replay is armed the hook stays out of the way, so a replayed run follows its
+ * recording instead of being handed new knowledge.
  *
  * Limitations, stated plainly
  * ---------------------------
@@ -19,6 +40,8 @@
  *   back from hash matching to position matching after the compaction point.
  * - Replayed responses keep the recorded token counts but report zero cost, so
  *   pi's session totals never claim you spent money you did not spend.
+ * - `tape_plan` and `tape_segment` describe and cut; they run nothing. The agent
+ *   still executes with its own tools, which is where the safety question lives.
  */
 
 import { readFileSync } from "node:fs";
