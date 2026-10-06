@@ -112,7 +112,7 @@ test("the recipe tools are registered on load", () => {
 
 	assert.deepEqual(
 		[...tools.keys()].sort(),
-		["tape_check", "tape_dub", "tape_search", "tape_show", "tape_splice"],
+		["tape_check", "tape_dub", "tape_plan", "tape_search", "tape_segment", "tape_show", "tape_splice"],
 	);
 });
 
@@ -160,7 +160,12 @@ test("tape_dub swaps a whole enumerated parameter and reports what is left", asy
 	);
 
 	const unfilled = await tools.get("tape_dub")?.execute("c2", { name: "frontend-setup" }, undefined, undefined, { cwd: workDir });
-	assert.match(unfilled?.content[0]?.text ?? "", /still unfilled: template, name/);
+	const unfilledText = unfilled?.content[0]?.text ?? "";
+	assert.match(unfilledText, /still unfilled:/);
+	// Each placeholder says what kind of thing is missing, because "fill in template"
+	// and "this was a credential, supply it yourself" are different instructions.
+	assert.match(unfilledText, /\[choice\] template/);
+	assert.match(unfilledText, /\[free\] name/);
 });
 
 test("tape_dub rejects an unknown enumerated value with the options", async () => {
@@ -305,7 +310,7 @@ test("the /tape command advertises the recipe subcommands", async () => {
 	tape(pi as never);
 
 	await commands.get("tape")?.("", contextFor(workDir));
-	assert.match(notices.join("\n"), /\/tape recipes/);
+	assert.match(notices.join("\n"), /\/tape library/);
 	assert.match(notices.join("\n"), /tape_search/);
 });
 

@@ -35,7 +35,18 @@ import { checkFreshness, formatFreshness } from "../src/freshness.ts";
 import { buildRecipeGraph, computeCentrality, detectCommunities, godSteps, recipeCommunities } from "../src/graph.ts";
 import { extractRecipe } from "../src/recipe-extract.ts";
 import { familyOrthogonality, intersectRecipes } from "../src/recipe-intersect.ts";
-import { composeRecipe, missingInputs, queryRecipes } from "../src/recipe-query.ts";
+import { composeRecipe, unfilledGaps, queryRecipes } from "../src/recipe-query.ts";
+import { bindRecipe, dangerOf, probeCommands, verifyConditions } from "../src/run.ts";
+import { segmentEvidence, segmentToRecipe, sliceRecipe, parseRange } from "../src/segment.ts";
+import {
+	compareAnswers,
+	formatRegression,
+	shapeOf,
+	summarizeRegression,
+	type RegressionReport,
+	type RegressionSample,
+} from "../src/regress.ts";
+import { entriesFromMessages } from "../src/replay.ts";
 import {
 	globalStoreDir,
 	indexIsStale,
@@ -54,16 +65,41 @@ import type { SessionFile, TapeFile } from "../src/types.ts";
 const PROVIDER = "tape";
 const STATUS_KEY = "tape";
 
+/**
+ * A model to compare the recording against.
+ *
+ * The recording is still what gets served; the live model is asked the same
+ * request in parallel. That is the only way to answer "does this upgrade change
+ * my behaviour?" — replay alone proves the recording is intact, not that the new
+ * model agrees with it.
+ */
+interface Shadow {
+	provider: string;
+	modelId: string;
+	samples: RegressionSample[];
+	liveTokens: number;
+	pending: number;
+}
+
 interface Armed {
 	path: string;
 	tape: TapeFile;
 	engine: ReplayEngine;
 	modelId: string;
 	registeredTools: string[];
+	shadow?: Shadow;
 }
 
 /** Module state: undefined means capture/live mode. */
 let armed: Armed | undefined;
+
+/**
+ * The model registry, captured when a shadow run is armed.
+ *
+ * A shadow run needs it to ask another model the recorded request; a plain replay
+ * never touches it.
+ */
+let liveRegistry: LiveRegistry | undefined;
 
 // ---------------------------------------------------------------------------
 // Recipes
@@ -105,8 +141,11 @@ export function recipeContext(cwd: string, budgetChars = 1800): string {
 						.join("|")}`,
 			)
 			.join(", ");
+		// A recipe learned partly from runs that failed is a hypothesis, and the agent
+		// is the one who decides whether that matters here.
+		const outcome = recipe.outcome.failures > 0 ? `, ⚠ ${recipe.outcome.failures} failed` : "";
 		lines.push(
-			`- **${recipe.name}** (${scope}, ${recipe.observations} obs, ${(recipe.orthogonality * 100).toFixed(0)}% orth)` +
+			`- **${recipe.name}** (${scope}, ${recipe.observations} obs, ${(recipe.orthogonality * 100).toFixed(0)}% orth${outcome})` +
 				(parameters ? ` — ${parameters}` : ""),
 		);
 	}
@@ -307,15 +346,19 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 
 			try {
 				const steps = composeRecipe(recipe, params.set ?? {});
-				const missing = missingInputs(steps);
+				// A placeholder is not just "something missing": a secret, a path and a
+				// project name each need a different action from whoever fills them, and
+				// the agent is the one who has to decide which it is looking at.
+				const gaps = unfilledGaps(recipe, steps);
 				const body = [`${recipe.name} — ${steps.length} step(s)`, "", ...steps.map((step, index) => `${index}. ${step}`)];
-				if (missing.length) {
-					body.push("", `still unfilled: ${missing.join(", ")}`);
+				if (gaps.length) {
+					body.push("", "still unfilled:");
+					for (const gap of gaps) body.push(`  [${gap.kind}] ${gap.name}: ${gap.hint}`);
 					body.push(
 						`available parameters: ${recipe.parameters.map((item) => item.name).join(", ") || "(none)"}`,
 					);
 				}
-				return textResult(body.join("\n"), { steps: steps.length, missing });
+				return textResult(body.join("\n"), { steps: steps.length, gaps });
 			} catch (error) {
 				const options = recipe.parameters
 					.map((item) => `${item.name}: ${item.variants.map((variant) => variant.label).join(", ")}`)
@@ -426,6 +469,172 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 					path: saved.path,
 				},
 			);
+		},
+	});
+
+	pi.registerTool({
+		name: "tape_plan",
+		label: "Plan a Recipe Run",
+		description:
+			"Work out what running a recipe would take: which gaps are still open and what kind each is, " +
+			"which tools this machine has, and which steps are pi tool calls rather than shell commands. " +
+			"Runs nothing. Use it before executing a learned procedure, and to decide what to fill in.",
+		parameters: Type.Object({
+			name: Type.String({ description: "Recipe name" }),
+			set: Type.Optional(
+				Type.Record(Type.String(), Type.String(), { description: "Values to fill in, e.g. { \"token\": \"…\" }" }),
+			),
+			cwd: Type.Optional(Type.String({ description: "Directory the procedure would run in. Defaults to the working directory." })),
+		}),
+		annotations: { readOnlyHint: true },
+		async execute(
+			_id: string,
+			params: { name: string; set?: Record<string, string>; cwd?: string },
+			_signal: unknown,
+			_update: unknown,
+			ctx: RecipeToolContext,
+		) {
+			const recipe = findRecipeInStore(ctx.cwd, params.name);
+			if (!recipe) return textResult(`No recipe matching "${params.name}".`, { found: false }, true);
+
+			const cwd = params.cwd ?? ctx.cwd;
+			const bound = bindRecipe(recipe, { set: params.set ?? {} });
+			const probe = await probeCommands(
+				recipe.contracts.requires.filter((item) => item.kind === "command").map((item) => item.target),
+				{ cwd },
+			);
+
+			const lines = [`${recipe.name} — ${bound.steps.length} step(s) in ${cwd}`, ""];
+			if (bound.notes.length) {
+				lines.push("bound:");
+				for (const note of bound.notes) lines.push(`  · ${note}`);
+			}
+			if (bound.gaps.length) {
+				lines.push("", "still open:");
+				for (const gap of bound.gaps) lines.push(`  [${gap.kind}] ${gap.name}: ${gap.hint}`);
+			}
+			if (probe.length) {
+				lines.push("", "this machine:");
+				for (const item of probe) lines.push(`  ${item.status === "available" ? "✓" : item.status === "missing" ? "✗" : "?"} ${item.command}`);
+			}
+			lines.push("", "steps:");
+			bound.steps.forEach((step, index) => {
+				const source = recipe.steps[index];
+				const danger = source && source.kind === "command" ? dangerOf(step) : undefined;
+				const marks = [source && source.kind !== "command" ? `→ agent (${source.kind})` : "", danger ? `⚠ ${danger}` : ""]
+					.filter(Boolean)
+					.join(" · ");
+				lines.push(`  ${index}. ${step}${marks ? `   ${marks}` : ""}`);
+			});
+			lines.push(
+				"",
+				"After running the steps, these are the conditions to check:",
+				...recipe.contracts.provides.map((item) => `  ${item.kind} ${item.target}`),
+			);
+
+			return textResult(lines.join("\n"), {
+				gaps: bound.gaps,
+				probe,
+				steps: bound.steps.length,
+				provides: recipe.contracts.provides,
+			});
+		},
+	});
+
+	pi.registerTool({
+		name: "tape_segment",
+		label: "Segment a Recipe",
+		description:
+			"Cut a recipe into parts with an intent, so a part can be carried into another composition. " +
+			"Call it without cuts first: it returns the numbered steps and their contracts, which is what " +
+			"you need to decide where the boundaries are. Then call it again with cuts to store the parts.",
+		parameters: Type.Object({
+			name: Type.String({ description: "Recipe name" }),
+			cuts: Type.Optional(
+				Type.Array(Type.String(), {
+					description: 'Step ranges that must tile the recipe, e.g. ["0-1", "2-3"]. Omit to get the evidence.',
+				}),
+			),
+			intents: Type.Optional(
+				Type.Array(Type.String(), { description: "One line per cut, on what that part is for. Becomes its name." }),
+			),
+			save: Type.Optional(Type.Boolean({ description: "Store each part as its own recipe. Default false." })),
+			requireCoverage: Type.Optional(
+				Type.Boolean({ description: "Refuse if the cuts do not cover every step. Default false (extraction)." }),
+			),
+			scope: Type.Optional(Type.String({ description: "global or project (default project)" })),
+		}),
+		annotations: { readOnlyHint: true },
+		async execute(
+			_id: string,
+			params: {
+				name: string;
+				cuts?: string[];
+				intents?: string[];
+				save?: boolean;
+				scope?: string;
+				requireCoverage?: boolean;
+			},
+			_ctx: unknown,
+			_update: unknown,
+			ctx: RecipeToolContext,
+		) {
+			const recipe = findRecipeInStore(ctx.cwd, params.name);
+			if (!recipe) return textResult(`No recipe matching "${params.name}".`, { found: false }, true);
+
+			if (!params.cuts?.length) {
+				return textResult(`${segmentEvidence(recipe)}\n\nPropose boundaries as ranges that cover every step exactly once.`, {
+					steps: recipe.steps.length,
+					parameters: recipe.parameters.map((parameter) => parameter.name),
+				});
+			}
+
+			let result;
+			try {
+				result = sliceRecipe(
+					recipe,
+					params.cuts.map((value, index) => {
+						const range = parseRange(value);
+						const intent = params.intents?.[index];
+						return { ...range, name: `${recipe.name}-${range.from}-${range.to}`, ...(intent === undefined ? {} : { intent }) };
+					}),
+				);
+			} catch (error) {
+				return textResult(`${(error as Error).message}\n\n${segmentEvidence(recipe)}`, { error: true }, true);
+			}
+
+			const lines: string[] = [`segmented "${recipe.name}" into ${result.segments.length} part(s)`, ""];
+			for (const segment of result.segments) {
+				lines.push(`${segment.name} (steps ${segment.from}-${segment.to})${segment.intent ? ` — ${segment.intent}` : ""}`);
+				for (const step of segment.steps) lines.push(`  · ${step.template}`);
+				const needs = segment.contracts.requires.map((item) => `${item.kind} ${item.target}`);
+				const gives = segment.contracts.provides.map((item) => `${item.kind} ${item.target}`);
+				if (needs.length) lines.push(`  needs ${needs.join(", ")}`);
+				if (gives.length) lines.push(`  gives ${gives.join(", ")}`);
+			}
+			if (result.uncovered.length) {
+				lines.push("", `not in any segment: ${result.uncovered.map((range) => `${range.from}-${range.to}`).join(", ")}`);
+			}
+			if (result.droppedParameters.length) {
+				lines.push("", "a cut split a parameter that has to move together:");
+				for (const item of result.droppedParameters) lines.push(`  ! ${item.name}: ${item.reason}`);
+			}
+
+			if (params.save) {
+				const scope = params.scope === "global" ? "global" : "project";
+				const storeDir = scope === "global" ? globalStoreDir() : projectStoreDir(ctx.cwd);
+				for (const segment of result.segments) {
+					const saved = saveRecipe(storeDir, segmentToRecipe(segment, { scope }));
+					lines.push(`saved ${segment.name} → ${saved.path}`);
+				}
+				const refreshed = refreshIndexIfStale(ctx.cwd);
+				if (refreshed.refreshed) lines.push(`index rebuilt → ${refreshed.path}`);
+			}
+
+			return textResult(lines.join("\n"), {
+				segments: result.segments.map((segment) => ({ name: segment.name, from: segment.from, to: segment.to })),
+				droppedParameters: result.droppedParameters,
+			});
 		},
 	});
 }
@@ -631,7 +840,9 @@ function recordCommand(args: string, ctx: ExtensionCommandContext): void {
 		session = sessionFromManager(branch, headerOf(ctx));
 	}
 
-	const result = recordSession(session, { name: args.trim() || undefined, piVersion: piVersion() });
+	const redact = /(^|\s)--redact(\s|$)/.test(args);
+	const name = args.replace(/(^|\s)--redact(\s|$)/, " ").trim() || undefined;
+	const result = recordSession(session, { name, piVersion: piVersion(), redact });
 	const out = join(ctx.cwd, `${slugify(result.tape.name ?? result.tape.id.slice(7, 19))}.tape`);
 
 	try {
@@ -647,6 +858,8 @@ function recordCommand(args: string, ctx: ExtensionCommandContext): void {
 			`tape recorded → ${out}`,
 			`  ${result.path.length} entries · ${(packed.length / 1024).toFixed(1)} KiB · profile ${result.tape.profile}${result.tape.lossy ? " (lossy)" : ""}`,
 			`  ${result.tape.stats.assistantMessages} assistant / ${result.tape.stats.toolResults} tool results · $${result.tape.stats.costUsd.toFixed(4)}`,
+			`  outcome ${result.tape.outcome?.status ?? "unknown"}${result.tape.outcome?.evidence[0] ? ` — ${result.tape.outcome.evidence[0]}` : ""}`,
+			redact ? "  credentials replaced by [redacted]; the tape is lossy but safe to share" : "",
 			result.branchPoints > 0 ? `  ${result.branchPoints} branch point(s) on this path` : "",
 		]
 			.filter(Boolean)
@@ -666,7 +879,12 @@ function resolveTapePath(reference: string, baseDir: string): string {
 	return resolve(baseDir, reference.endsWith(".tape") ? reference : `${reference}.tape`);
 }
 
-function playCommand(pi: ExtensionAPI, reference: string, ctx: ExtensionCommandContext): void {
+function playCommand(
+	pi: ExtensionAPI,
+	reference: string,
+	ctx: ExtensionCommandContext,
+	shadowTarget?: { provider: string; modelId: string },
+): void {
 	if (!reference.trim()) {
 		ctx.ui.notify("Usage: /tape play <file.tape>", "warning");
 		return;
@@ -689,6 +907,10 @@ function playCommand(pi: ExtensionAPI, reference: string, ctx: ExtensionCommandC
 	const recordedModels = tape.stats.models;
 	const modelId = recordedModels[0] ?? "replay";
 	const active: Armed = { path, tape, engine, modelId, registeredTools: [] };
+	if (shadowTarget) {
+		active.shadow = { ...shadowTarget, samples: [], liveTokens: 0, pending: 0 };
+		liveRegistry = ctx.modelRegistry as unknown as LiveRegistry;
+	}
 	armed = active;
 
 	pi.registerProvider(PROVIDER, {
@@ -707,6 +929,10 @@ function playCommand(pi: ExtensionAPI, reference: string, ctx: ExtensionCommandC
 		streamSimple: (model, context, options) => {
 			const current = armed;
 			if (!current) throw new Error("tape: replay is not armed");
+			// The recorded answer is served either way; the shadow call only observes.
+			if (current.shadow && liveRegistry) {
+				void observeWithLiveModel(current, liveRegistry, context as { messages: unknown[] }, options);
+			}
 			return createReplayStream(
 				model as unknown as { api: string; provider: string; id: string },
 				context as unknown as { messages: unknown[] },
@@ -775,6 +1001,109 @@ function playCommand(pi: ExtensionAPI, reference: string, ctx: ExtensionCommandC
 	);
 }
 
+
+// ---------------------------------------------------------------------------
+// Shadow: asking a different model the same request
+// ---------------------------------------------------------------------------
+
+/**
+ * The part of the model registry this file needs.
+ *
+ * Typed structurally so the file does not depend on pi's internal declarations,
+ * and so a missing method is a compile error here instead of a runtime surprise
+ * in the middle of a replay.
+ */
+interface LiveRegistry {
+	find(provider: string, modelId: string): unknown;
+	streamSimple(model: unknown, context: unknown, options?: unknown): AsyncIterable<unknown>;
+}
+
+/** Consume a provider stream, keeping the last whole message it produced. */
+async function collectLiveAnswer(
+	stream: AsyncIterable<unknown>,
+): Promise<{ message: unknown; tokens: number }> {
+	let last: unknown;
+	for await (const event of stream) {
+		const item = event as { type?: string; message?: unknown; error?: unknown; partial?: unknown };
+		if (item.type === "done") last = item.message;
+		else if (item.type === "error") last = item.error;
+		else if (item.partial !== undefined) last = item.partial;
+	}
+	const usage = (last as { usage?: { input?: number; output?: number; totalTokens?: number } } | undefined)?.usage;
+	const tokens = usage ? (usage.totalTokens ?? (usage.input ?? 0) + (usage.output ?? 0)) : 0;
+	return { message: last, tokens };
+}
+
+/** A short label for a turn, so a report can be navigated. */
+function labelOfTurn(recorded: unknown, index: number): string {
+	const shape = shapeOf(recorded as never);
+	const first = shape.text.split("\n")[0] ?? "";
+	const calls = shape.toolCalls.map((call) => call.name).join(", ");
+	return `#${index}${calls ? ` [${calls}]` : ""}${first ? ` ${first.slice(0, 70)}` : ""}`;
+}
+
+/**
+ * Ask the shadow model the same request the recording answers.
+ *
+ * Runs in the background: the recorded answer is served immediately, so the run
+ * follows the recorded trajectory, and the comparison is collected for later. It
+ * costs real tokens, which the report says out loud.
+ */
+async function observeWithLiveModel(
+	active: Armed,
+	registry: LiveRegistry,
+	context: { messages: unknown[] },
+	options: unknown,
+): Promise<void> {
+	const shadow = active.shadow;
+	if (!shadow) return;
+
+	const target = registry.find(shadow.provider, shadow.modelId);
+	if (!target) {
+		shadow.pending = -1;
+		return;
+	}
+
+	// The answer the replay is about to serve, looked up without consuming it.
+	const prefix = entriesFromMessages(context.messages);
+	const recorded = active.engine.peekAssistant(prefix);
+	if (!recorded) return;
+
+	shadow.pending++;
+	try {
+		const stream = registry.streamSimple(target, context, options);
+		const live = await collectLiveAnswer(stream);
+		shadow.liveTokens += live.tokens;
+		shadow.samples.push({
+			label: labelOfTurn(recorded, shadow.samples.length + 1),
+			divergences: compareAnswers(shapeOf(recorded), shapeOf(live.message as never)),
+		});
+	} catch (error) {
+		shadow.samples.push({
+			label: labelOfTurn(recorded, shadow.samples.length + 1),
+			divergences: [
+				{ kind: "error", detail: "the shadow call failed", recorded: "(answered)", live: (error as Error).message },
+			],
+		});
+	} finally {
+		shadow.pending--;
+	}
+}
+
+function shadowReport(active: Armed): RegressionReport {
+	const report: RegressionReport = {
+		tape: active.tape.name ?? active.tape.id.slice(7, 19),
+		recordedModel: active.tape.stats.models[0] ?? "(unknown)",
+		liveModel: active.shadow ? `${active.shadow.provider}/${active.shadow.modelId}` : "(none)",
+		samples: active.shadow?.samples ?? [],
+		structuralDivergences: 0,
+		wordingDivergences: 0,
+		identical: 0,
+		liveTokens: active.shadow?.liveTokens ?? 0,
+	};
+	return summarizeRegression(report);
+}
+
 function statusCommand(ctx: ExtensionCommandContext): void {
 	if (!armed) {
 		ctx.ui.notify("tape: record mode. Use /tape record [name], or /tape play <file.tape>.", "info");
@@ -791,7 +1120,13 @@ function statusCommand(ctx: ExtensionCommandContext): void {
 			`  misses     ${misses.length}`,
 			...misses.slice(-3).map((miss) => `    · [${miss.kind}] ${miss.detail}`),
 			`  recorded   $${armed.tape.stats.costUsd.toFixed(4)} (this replay cost $0)`,
-		].join("\n"),
+			armed.shadow
+				? `  shadow     ${armed.shadow.samples.length}/${armed.engine.assistantCount} compared against ` +
+					`${armed.shadow.provider}/${armed.shadow.modelId} · ${armed.shadow.liveTokens} tokens spent`
+				: "",
+		]
+			.filter(Boolean)
+			.join("\n"),
 		misses.length ? "warning" : "info",
 	);
 }
@@ -828,6 +1163,44 @@ export default function (pi: ExtensionAPI) {
 				case "play":
 					playCommand(pi, rest, ctx);
 					return;
+				case "shadow": {
+					// `--model provider/id` names the model to compare against; the
+					// recording is still what gets served.
+					const parts = rest.trim().split(/\s+/).filter(Boolean);
+					const modelArgument = parts.find((part) => part === "--model" || part.startsWith("--model="));
+					const modelValue =
+						modelArgument === "--model"
+							? parts[parts.indexOf("--model") + 1]
+							: modelArgument?.slice("--model=".length);
+					const file = parts.filter((part) => part !== "--model" && part !== modelValue).join(" ");
+					if (!modelValue || !modelValue.includes("/")) {
+						ctx.ui.notify(
+							"Usage: /tape shadow <file.tape> --model <provider>/<model>\n" +
+								"The recording is served as usual; the named model is asked the same requests.",
+							"warning",
+						);
+						return;
+					}
+					const [provider, ...idParts] = modelValue.split("/");
+					playCommand(pi, file, ctx, { provider: provider as string, modelId: idParts.join("/") });
+					return;
+				}
+				case "regress": {
+					if (!armed) {
+						ctx.ui.notify("Nothing armed. Start one with /tape shadow <file.tape> --model <provider>/<model>.", "warning");
+						return;
+					}
+					if (!armed.shadow) {
+						ctx.ui.notify("This run is not in shadow mode, so there is nothing to compare.", "warning");
+						return;
+					}
+					if (armed.shadow.pending !== 0) {
+						ctx.ui.notify(`${armed.shadow.pending} comparison(s) still running; try again in a moment.`, "info");
+						return;
+					}
+					ctx.ui.notify(formatRegression(shadowReport(armed)), "info");
+					return;
+				}
 				case "status":
 					statusCommand(ctx);
 					return;
@@ -838,6 +1211,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					pi.unregisterProvider(PROVIDER);
 					armed = undefined;
+					liveRegistry = undefined;
 					ctx.ui.setStatus(STATUS_KEY, undefined);
 					ctx.ui.notify(
 						"Replay disarmed. Tool overrides stay registered until /reload, and will refuse to run.",
@@ -881,17 +1255,22 @@ export default function (pi: ExtensionAPI) {
 						[
 							"tape — recordings, replay and recipes for pi sessions",
 							"",
-							"  /tape record [name]   save this session as a .tape file",
-							"  /tape play <file>      arm deterministic replay from a recording",
-							"  /tape status           replay progress and misses",
-							"  /tape stop              disarm (then /reload to restore real tools)",
-							"  /tape recipes          list the recipe store",
-							"  /tape index            rebuild the recipe graph index",
+							"  /tape record [--redact]  save this session as a .tape file",
+							"  /tape play <file>        arm deterministic replay from a recording",
+							"  /tape shadow <file> --model <provider>/<model>",
+							"                           replay, and ask another model the same requests",
+							"  /tape regress            what the shadow model answered differently",,
+							"  /tape status             replay progress, misses, shadow progress",
+							"  /tape stop               disarm (then /reload to restore real tools)",
+							"  /tape library            list the recipe store",
+							"  /tape index              rebuild the recipe graph index",
 							"",
-							"Tools: tape_search, tape_show, tape_dub, tape_check, tape_splice",
-							"CLI:   pi-tape sessions | capture | inspect | verify | diff",
-							"       pi-tape splice | library | recipe | compose | search | index | fresh",
-						].join("\n"),
+							"Tools: tape_search, tape_show, tape_dub, tape_check, tape_splice,",
+							"       tape_plan, tape_segment",,
+							"CLI:   pi-tape sessions | record | inspect | verify | diff",
+							"       pi-tape splice | link | segment | run | library | show | dub",
+							"       pi-tape search | index | check",,
+							].join("\n"),
 						"info",
 					);
 			}
@@ -900,5 +1279,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		armed = undefined;
+		liveRegistry = undefined;
 	});
 }
