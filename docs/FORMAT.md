@@ -38,6 +38,7 @@ just as well, so a tape can be inspected and hand-edited with any text tool.
 | `dropped` | string[] | yes | Human-readable list of what was dropped. |
 | `source` | object | yes | Provenance, see below. |
 | `stats` | object | yes | Pre-computed run statistics, see below. |
+| `outcome` | object | no | How the run ended, see below. Absent in tapes recorded before it existed. |
 | `dict` | string[] | yes | String pool. May be empty. |
 | `entries` | TapeEntry[] | yes | The recorded branch, in order. |
 
@@ -69,6 +70,34 @@ reader can summarise a tape without decoding the entries.
 | `costUsd` | number | Sum of recorded costs. |
 | `tools` | string[] | Tool names seen in calls or results, sorted. |
 | `models` | string[] | Model ids seen, sorted, first is used for replay. |
+
+### `outcome`
+
+Whether the run achieved anything is not visible in its transcript, so it is
+derived at record time and stored. It is *not* part of `id`: the content address
+covers `entries`, and how a run is judged is an interpretation of them.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | `"success" \| "failed" \| "unknown"` | How the run ended. |
+| `evidence` | string[] | Why, in a form that can be argued with. Credentials are redacted here too. |
+| `declared` | boolean? | True when a human said so (`pi-tape record --status …`) rather than the recorder inferring it. |
+
+How `status` is decided:
+
+1. A declared status wins.
+2. Otherwise the **last** verification command decides. `npm test`, `npm run build`,
+   `pytest`, `cargo test`, `make`, `tsc` and friends are verification commands. A
+   failed step that a later green verification made good is a successful run, and
+   the failed attempt is still reported in `evidence`.
+3. With no verification: any errored tool result makes it `failed`.
+4. Otherwise `unknown` — never `success`. Absence of errors is not evidence that
+   anything was achieved, the same rule the freshness check follows.
+
+A recipe learned from several tapes carries the combined verdict, and
+`pi-tape splice` keeps `failed` recordings out of the skeleton unless
+`--include-failed` is passed. They are counted either way: a recording of what did
+not work is evidence, but not about what the procedure is.
 
 ## Entries
 
@@ -116,6 +145,13 @@ a number. Any other object is ordinary data.
 | `normal` | nothing; pools long strings | `false` |
 | `minimal` | thinking blocks, `usage`/`label`/`session_info` entries, tool-result `details`/`nestedCalls`/`usage`, tool results truncated to 4000 characters | `true` |
 
+`pi-tape record --redact` is not a profile. It runs a credential pass over the whole
+recording — tool arguments, tool results, assistant text — replacing what looks like a
+secret with `[redacted]`, and marks the tape `lossy` so nobody mistakes it for the same
+run. It is the difference between a tape you keep and a tape you send. It catches what
+is recognisable as a credential, which is not the same as catching everything: read a
+tape before sharing it, and treat a shared tape as public.
+
 A `minimal` tape still replays, but the request prefixes differ from the
 original, so hash lookups fall back to position matching. Truncated results are
 marked inline with a `[tape: truncated, N characters dropped]` suffix.
@@ -128,6 +164,7 @@ marked inline with a `[tape: truncated, N characters dropped]` suffix.
    and preserve them.
 4. Treat unknown `stats` fields as absent rather than an error.
 5. Expand `$d` references before interpreting any entry.
+6. Treat a missing `outcome` as `unknown`, never as a success.
 
 ## Recording a tape
 
