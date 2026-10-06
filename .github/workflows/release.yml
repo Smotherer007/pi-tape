@@ -39,4 +39,28 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
+          # Pinned, not inherited: an ambient dry-run makes `npm publish` exit 0
+          # without publishing, and then the job is green while the registry never
+          # saw the version.
+          NPM_CONFIG_DRY_RUN: "false"
         run: npx semantic-release
+
+      # A green release job is not evidence that the version reached the registry.
+      # The 1.1.2 release produced a tag, a version bump and a GitHub release, and
+      # npm never received it -- and this job reported success. It does not any more:
+      # the run fails unless the version the release just bumped to is fetchable.
+      - name: Verify the released version is on npm
+        env:
+          NPM_CONFIG_DRY_RUN: "false"
+        run: |
+          version=$(node -p "require('./package.json').version")
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "@patimweb/pi-tape@${version}" version >/dev/null 2>&1; then
+              echo "npm has @patimweb/pi-tape@${version}"
+              exit 0
+            fi
+            echo "not on npm yet (attempt ${attempt}); waiting"
+            sleep 15
+          done
+          echo "::error::release ${version} was tagged but is not on npm -- read the Release step above"
+          exit 1
