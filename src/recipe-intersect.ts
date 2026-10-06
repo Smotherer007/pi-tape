@@ -338,13 +338,7 @@ export function intersectRecipes(allRecipes: Recipe[], options: IntersectOptions
 	const combined = combineOutcomes(
 		allRecipes.map((recipe) => recipe.outcome),
 		failed.length
-			? [
-					`${failed.length} failed recording(s) excluded from the skeleton: ` +
-						// The recipe name is whatever the caller called the splice; the
-						// description is what the recording was called. Naming the tape is
-						// the only one of the two that identifies it.
-						failed.map((recipe) => recipe.description.replace(/^Learned from "|"$/g, "") || recipe.name).join(", "),
-				]
+			? [`${failed.length} failed recording(s) excluded from the skeleton: ${failed.map(nameOfRecording).join(", ")}`]
 			: [],
 	);
 	merged.outcome = {
@@ -517,6 +511,21 @@ function coVary(a: Map<number, string>, b: Map<number, string>): boolean {
 
 	// A single shared recording cannot establish co-variation.
 	return shared >= 2 && forward.size >= 2;
+}
+
+/**
+ * What a recording is called, by its name if it has one and by its id if not.
+ *
+ * Not by the recipe's name: that is whatever the caller called this splice, so it
+ * identifies nothing. A shared default name would be worse still -- three tapes
+ * called "frontend" would report "frontend, frontend, frontend" and tell you
+ * nothing about which one failed.
+ */
+function nameOfRecording(recipe: Recipe): string {
+	const named = /^Learned from "(.+)"$/.exec(recipe.description)?.[1];
+	if (named) return named;
+	const id = recipe.learnedFrom[0];
+	return id ? `tape ${id.slice(7, 19)}` : recipe.name;
 }
 
 function commonName(recipes: Recipe[]): string {
