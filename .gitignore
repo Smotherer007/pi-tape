@@ -11,6 +11,9 @@ node_modules/
 # Mind Place knowledge graph: derived from the sources, regenerable, large.
 graph-out/
 
+# Compiled CLI and extension: built by `npm run build` before publishing.
+dist/
+
 # Editor and OS noise
 .DS_Store
 *.log

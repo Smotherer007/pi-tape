@@ -1,0 +1,16 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": false,
+		"outDir": "dist",
+		"rootDir": ".",
+		"declaration": false,
+		"sourceMap": false,
+		// The sources import each other as `./x.ts`, which is what node needs when it
+		// runs them straight from a checkout. The emitted JavaScript cannot keep that
+		// extension, so it is rewritten on the way out.
+		"rewriteRelativeImportExtensions": true
+	},
+	// Tests are not shipped and are not built.
+	"include": ["src/**/*.ts", "extensions/**/*.ts"]
+}

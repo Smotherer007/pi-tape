@@ -27,9 +27,10 @@
   },
   "homepage": "https://github.com/Smotherer007/pi-tape#readme",
   "bin": {
-    "pi-tape": "./src/cli.ts"
+    "pi-tape": "./dist/src/cli.js"
   },
   "files": [
+    "dist",
     "src",
     "extensions",
     "docs",
@@ -37,7 +38,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "echo 'No build step: pi loads the TypeScript sources directly.'",
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
     "test": "node --test 'test/**/*.test.ts'",
     "test:watch": "node --test --watch 'test/**/*.test.ts'",
     "test:coverage": "node --experimental-test-coverage --test 'test/**/*.test.ts'",
@@ -59,7 +61,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/index.ts"
+      "./dist/extensions/index.js"
     ]
   }
 }
