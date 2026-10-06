@@ -31,6 +31,18 @@ export interface CutRequest {
 	intent?: string;
 }
 
+/**
+ * A cut as the caller wrote it.
+ *
+ * The segment name is derived -- a slug of the intent, or the range when there is
+ * no intent -- so an error message that uses it names something the caller never
+ * typed. The range and the intent are what they did type.
+ */
+function describeCut(cut: CutRequest): string {
+	const intent = cut.intent ? ` ("${cut.intent}")` : "";
+	return `cut ${cut.from}-${cut.to}${intent}`;
+}
+
 export interface SliceResult {
 	segments: Segment[];
 	/** Parameters of the source that no segment could keep, with the reason. */
@@ -109,18 +121,18 @@ export function sliceRecipe(recipe: Recipe, cuts: CutRequest[], options: SliceOp
 	let next = 0;
 	for (const cut of ordered) {
 		if (!Number.isInteger(cut.from) || !Number.isInteger(cut.to) || cut.from < 0 || cut.to < cut.from) {
-			throw new Error(`cut "${cut.name}" is not a step range: ${cut.from}-${cut.to}`);
+			throw new Error(`${describeCut(cut)} is not a step range`);
 		}
 		if (cut.to > recipe.steps.length - 1) {
 			throw new Error(
-				`cut "${cut.name}" ends at step ${cut.to}, but the recipe has ${recipe.steps.length} step(s) ` +
+				`${describeCut(cut)} ends at step ${cut.to}, but the recipe has ${recipe.steps.length} step(s) ` +
 					`(last index ${recipe.steps.length - 1})`,
 			);
 		}
 		// Overlap is always a mistake: it would run a step twice.
 		if (cut.from < next) {
 			throw new Error(
-				`cut "${cut.name}" starts at ${cut.from}, which is already inside an earlier cut (up to ${next - 1}). ` +
+				`${describeCut(cut)} starts at ${cut.from}, which is already inside an earlier cut (up to ${next - 1}). ` +
 					`Segments must not overlap.`,
 			);
 		}
