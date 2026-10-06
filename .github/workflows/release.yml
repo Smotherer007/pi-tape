@@ -45,22 +45,25 @@ jobs:
           NPM_CONFIG_DRY_RUN: "false"
         run: npx semantic-release
 
-      # A green release job is not evidence that the version reached the registry.
-      # The 1.1.2 release produced a tag, a version bump and a GitHub release, and
-      # npm never received it -- and this job reported success. It does not any more:
-      # the run fails unless the version the release just bumped to is fetchable.
+      # A green release job is not by itself evidence that the version reached the
+      # registry, so this checks. It waits, and it has to: npm's registry takes
+      # minutes to show a new version, and the packument is served from a CDN.
+      # Measured on this package, 1.1.2 was tagged at 07:07:40 and fetchable at
+      # 07:11:48. An earlier version of this check waited 90 seconds and reported a
+      # failed publish that had in fact succeeded -- a guard that cries wolf is the
+      # failure mode it was meant to prevent, read from the other end.
       - name: Verify the released version is on npm
         env:
           NPM_CONFIG_DRY_RUN: "false"
         run: |
           version=$(node -p "require('./package.json').version")
-          for attempt in 1 2 3 4 5 6; do
-            if npm view "@patimweb/pi-tape@${version}" version >/dev/null 2>&1; then
+          for attempt in $(seq 1 20); do
+            if npm view "@patimweb/pi-tape@${version}" version --prefer-online >/dev/null 2>&1; then
               echo "npm has @patimweb/pi-tape@${version}"
               exit 0
             fi
-            echo "not on npm yet (attempt ${attempt}); waiting"
-            sleep 15
+            echo "not on npm yet (attempt ${attempt}/20)"
+            sleep 30
           done
-          echo "::error::release ${version} was tagged but is not on npm -- read the Release step above"
+          echo "::error::release ${version} was tagged ten minutes ago and is still not on npm -- read the Release step above"
           exit 1

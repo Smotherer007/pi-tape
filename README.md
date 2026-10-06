@@ -424,6 +424,11 @@ declares as its floor — a floor that is never tested is a guess.
 messages, publishes to npm with provenance, writes the changelog, opens the GitHub
 release, and commits the version bump back with `[skip ci]`.
 
+A published version takes a few minutes to become visible: npm serves the package
+document from a cache, so `npm view` can report the previous version for several
+minutes after a successful release. That is propagation, not a failed publish — worth
+knowing before concluding that the pipeline broke.
+
 So commit messages are the release mechanism. `fix:` is a patch, `feat:` is a minor,
 `feat!:` or a `BREAKING CHANGE:` footer is a major, and a push whose commits are
 only `docs:`/`chore:`/`test:` publishes nothing at all — which is why a change
