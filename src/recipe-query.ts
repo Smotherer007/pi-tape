@@ -317,13 +317,17 @@ export function composeRecipe(recipe: Recipe, assignments: Record<string, string
 	recipe.steps.forEach((step, stepIndex) => {
 		let text = step.template;
 		for (const slot of step.usesSlots) {
-			const fromParameter = parameterValues.get(`${stepIndex}#${slot}`);
-			if (fromParameter !== undefined) {
-				text = text.replaceAll(`{{${slot}}}`, fromParameter);
+			// An explicit assignment wins over the variant, and the order matters:
+			// a parameter is a *guess* that its members move together, and with a thin
+			// family that guess can swallow a slot the caller named. Silently ignoring
+			// what the caller asked for is the one outcome that is always wrong here.
+			const direct = assignments[slot];
+			if (direct !== undefined) {
+				text = text.replaceAll(`{{${slot}}}`, direct);
 				continue;
 			}
-			const direct = assignments[slot];
-			if (direct !== undefined) text = text.replaceAll(`{{${slot}}}`, direct);
+			const fromParameter = parameterValues.get(`${stepIndex}#${slot}`);
+			if (fromParameter !== undefined) text = text.replaceAll(`{{${slot}}}`, fromParameter);
 		}
 		out.push(text);
 	});
