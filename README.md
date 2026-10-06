@@ -21,24 +21,6 @@ A recipe is not just a list of steps. It carries what could not be learned — t
 recordings share, `link` says whether two different recordings fit together, and
 `run` binds the gaps, probes the machine, executes and checks the result.
 
-```
-╭─ tape "next big thing" sha256:825d832bed7b
-│ format      pi-tape v1 (profile: normal)
-│ size        145.6 KiB on disk · 140 pooled strings · 116 entries
-╰─
-
-Run
-  messages    108 (4 user, 43 assistant, 60 tool results)
-  tokens      3,179,678 (72,970 in / 50,196 out)
-  cost        $0.1005
-
-Context cost per tool (result characters)
-  bash            28 calls  ████████████████████████ 58,357 chars (~14,589 tok)
-
-Self-test
-  ✓ tape is complete
-```
-
 What that is good for, in one screen:
 
 - **The second run costs less than the first.** The agent checks the store before it
@@ -58,6 +40,23 @@ What that is good for, in one screen:
   redacted before the file is written, and a recording states how it ended, so nobody
   learns a procedure from a run that failed.
 
+```
+╭─ tape "next big thing" sha256:825d832bed7b
+│ format      pi-tape v1 (profile: normal)
+│ size        145.6 KiB on disk · 140 pooled strings · 116 entries
+╰─
+
+Run
+  messages    108 (4 user, 43 assistant, 60 tool results)
+  tokens      3,179,678 (72,970 in / 50,196 out)
+  cost        $0.1005
+
+Context cost per tool (result characters)
+  bash            28 calls  ████████████████████████ 58,357 chars (~14,589 tok)
+
+Self-test
+  ✓ tape is complete
+```
 ## Why a tape plays back exactly
 
 An LLM call is a pure function of its prefix. Hash the prefix (messages plus tool
