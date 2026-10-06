@@ -338,7 +338,13 @@ export function intersectRecipes(allRecipes: Recipe[], options: IntersectOptions
 	const combined = combineOutcomes(
 		allRecipes.map((recipe) => recipe.outcome),
 		failed.length
-			? [`${failed.length} failed recording(s) excluded from the skeleton: ${failed.map((r) => r.name).join(", ")}`]
+			? [
+					`${failed.length} failed recording(s) excluded from the skeleton: ` +
+						// The recipe name is whatever the caller called the splice; the
+						// description is what the recording was called. Naming the tape is
+						// the only one of the two that identifies it.
+						failed.map((recipe) => recipe.description.replace(/^Learned from "|"$/g, "") || recipe.name).join(", "),
+				]
 			: [],
 	);
 	merged.outcome = {
