@@ -8,6 +8,9 @@ node_modules/
 # Local recordings
 *.tape
 
+# Mind Place knowledge graph: derived from the sources, regenerable, large.
+graph-out/
+
 # Editor and OS noise
 .DS_Store
 *.log
