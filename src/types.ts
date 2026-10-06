@@ -86,6 +86,22 @@ export interface TapeStats {
 
 export type TapeProfile = "full" | "normal" | "minimal";
 
+export type TapeOutcomeStatus = "success" | "failed" | "unknown";
+
+/**
+ * How the recorded run ended, and the evidence for saying so.
+ *
+ * Derived at record time from tool results and verification commands, or
+ * declared by the caller. A capture without an outcome is treated as `unknown`,
+ * never as a success.
+ */
+export interface TapeOutcome {
+	status: TapeOutcomeStatus;
+	evidence: string[];
+	/** True when a human said so rather than the recorder inferring it. */
+	declared?: boolean;
+}
+
 export interface TapeFile {
 	magic: "pi-tape";
 	version: 1;
@@ -100,6 +116,8 @@ export interface TapeFile {
 	dropped: string[];
 	source: TapeSource;
 	stats: TapeStats;
+	/** How the run ended. Absent in recordings made before it was derived. */
+	outcome?: TapeOutcome;
 	/** Deduplication pool for large repeated strings; entries reference it by index. */
 	dict: string[];
 	entries: TapeEntry[];

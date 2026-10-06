@@ -9,6 +9,7 @@
 import type {
 	TapeEntry,
 	TapeFile,
+	TapeOutcomeStatus,
 	TapeProfile,
 	TapeSource,
 	SessionEntry,
@@ -17,6 +18,8 @@ import type {
 import { activeLeaf, branchPoints, pathToLeaf } from "./session.ts";
 import { buildDictionary, DICT_MIN_LENGTH, MINIMAL_TOOL_RESULT_CHARS, tapeId } from "./tape.ts";
 import { computeStats } from "./stats.ts";
+import { deriveOutcome } from "./outcome.ts";
+import { redactEntries, REDACTED_MARK } from "./redact.ts";
 
 export interface RecordOptions {
 	profile?: TapeProfile;
@@ -24,6 +27,14 @@ export interface RecordOptions {
 	/** Capture this leaf's ancestry instead of the session's active leaf. */
 	leafId?: string | null;
 	piVersion?: string;
+	/** Declare how the run ended, overriding what the recorder can infer. */
+	status?: TapeOutcomeStatus;
+	/**
+	 * Replace every credential in the recording with `[redacted]`. This is what makes
+	 * a tape safe to hand to someone else, and it is lossy by definition: a redacted
+	 * tape is no longer the same run.
+	 */
+	redact?: boolean;
 }
 
 const MINIMAL_DROP_TYPES = new Set(["usage", "label", "session_info"]);
@@ -113,9 +124,23 @@ export function recordSession(session: SessionFile, options: RecordOptions = {})
 		}
 	}
 
+	if (options.redact) {
+		// After the profile transform and before the string pool: nothing pooled and
+		// nothing referenced may still hold a credential.
+		const result = redactEntries(entries);
+		entries = result.entries;
+		if (result.redactions > 0) {
+			dropped.push(`${result.redactions} credential(s) replaced by ${REDACTED_MARK}`);
+			lossy = true;
+		}
+	}
+
 	const { value, dict } = buildDictionary(entries);
 	const dictedEntries = value as TapeEntry[];
 	const resolvedStats = computeStats(entries);
+	// Derived from the entries the tape actually carries, so the outcome and the
+	// recording cannot disagree.
+	const outcome = deriveOutcome(entries, options.status);
 
 	const source: TapeSource = {
 		sessionFile: session.path,
@@ -136,6 +161,7 @@ export function recordSession(session: SessionFile, options: RecordOptions = {})
 		dropped,
 		source,
 		stats: resolvedStats,
+		outcome,
 		dict,
 		entries: dictedEntries,
 	};

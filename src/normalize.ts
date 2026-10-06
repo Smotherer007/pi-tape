@@ -14,6 +14,8 @@
 
 import { basename, extname } from "node:path";
 
+import { classifyGapKind, findSecret, isSecretVariableName, REDACTED_MARK, secretLabelOf, type GapKind } from "./redact.ts";
+
 /** Words that carry the action rather than the argument. */
 const VERB_DEPTH = 2;
 
@@ -40,10 +42,21 @@ export interface CommandShape {
 
 /** One shell token, with the literal it replaced when it was normalized away. */
 export interface AnalyzedToken {
+	/** The spelling in the source, quotes included, so a template can render back. */
 	raw: string;
+	/** The unquoted content, which is what a value *is*. */
+	original: string;
+	/** The quote character, when the token was written quoted. */
+	quote?: string;
 	text: string;
 	/** Set when this token was replaced; the original text. */
 	literal?: string;
+	/**
+	 * Set when the token carried a credential. `prefix`/`suffix` are the scaffolding
+	 * around it (`Authorization: Bearer ` / ``), kept so the template still says
+	 * what the value is *for* while the value itself is thrown away.
+	 */
+	secret?: { label: string; prefix: string; suffix: string };
 	/**
 	 * Slot name implied by the token's *position* rather than its content.
 	 * `npm install vue-router` and `npm install react-router-dom` look nothing
@@ -96,14 +109,25 @@ export function analyzeCommand(command: string): AnalyzedCommand {
 			operators.push(part);
 			continue;
 		}
-		const tokens = tokenizeShell(part)
-			.filter((token) => !isRedirection(token))
-			.map((token) => {
-				const result = normalizeToken(token);
-				return result.replaced === undefined
-					? { raw: token, text: result.text }
-					: { raw: token, text: result.text, literal: result.replaced };
-			});
+		const tokens: AnalyzedToken[] = [];
+		let verbatimNext = false;
+		for (const token of tokenizeShellDetailed(part)) {
+			// A redirection and its target are kept in the template but contribute
+			// nothing to the key: `> /dev/null` was dropped entirely before, which made
+			// the rendered command mean something else.
+			if (verbatimNext || isRedirection(token.original)) {
+				tokens.push({ raw: token.raw, original: token.original, text: "" });
+				verbatimNext = isRedirection(token.original);
+				continue;
+			}
+			verbatimNext = false;
+			const result = normalizeToken(token.original);
+			const base: AnalyzedToken = { raw: token.raw, original: token.original, text: result.text };
+			if (token.quote !== undefined) base.quote = token.quote;
+			if (result.replaced !== undefined) base.literal = result.replaced;
+			if (result.secret !== undefined) base.secret = result.secret;
+			tokens.push(base);
+		}
 		segments.push({ tokens, key: tokens.map((token) => token.text).join(" ") });
 	}
 
@@ -132,12 +156,16 @@ export function analyzeCommand(command: string): AnalyzedCommand {
 /**
  * Render a command back from its analysis, replacing each normalized-away literal
  * with a placeholder. `nameFor(token, occurrence)` decides the placeholder name.
+ *
+ * A token that carried a credential keeps its scaffolding and loses only the
+ * value: the template reads `Authorization: Bearer {{token}}`, and the slot's
+ * value is the redaction marker rather than the credential.
  */
 export function renderTemplate(
 	analyzed: AnalyzedCommand,
 	nameFor: (token: AnalyzedToken, occurrence: number) => string,
-): { template: string; slots: Array<{ name: string; value: string }> } {
-	const slots: Array<{ name: string; value: string }> = [];
+): { template: string; slots: Array<{ name: string; value: string; secret?: boolean }> } {
+	const slots: Array<{ name: string; value: string; secret?: boolean }> = [];
 	let occurrence = 0;
 	const pieces: string[] = [];
 
@@ -146,10 +174,19 @@ export function renderTemplate(
 		pieces.push(
 			segment.tokens
 				.map((token) => {
+					// Quotes come back around the placeholder, because a value that was
+					// quoted in the recording has to stay quoted in the command.
+					const wrap = (inner: string) => (token.quote === undefined ? inner : `${token.quote}${inner}${token.quote}`);
+					if (token.secret) {
+						const name = nameFor(token, occurrence++);
+						slots.push({ name, value: REDACTED_MARK, secret: true });
+						return wrap(`${token.secret.prefix}{{${name}}}${token.secret.suffix}`);
+					}
+					// Nothing was replaced: emit the original spelling, quotes included.
 					if (token.literal === undefined) return token.raw;
 					const name = nameFor(token, occurrence++);
 					slots.push({ name, value: token.literal });
-					return `{{${name}}}`;
+					return wrap(`{{${name}}}`);
 				})
 				.join(" "),
 		);
@@ -198,28 +235,65 @@ export function splitOnOperators(command: string): string[] {
 
 /** Quote-aware whitespace split. */
 export function tokenizeShell(segment: string): string[] {
-	const tokens: string[] = [];
+	return tokenizeShellDetailed(segment).map((token) => token.original);
+}
+
+/**
+ * One shell token with both spellings kept.
+ *
+ * `original` is the unquoted content, which is what a value *is*. `raw` is how it
+ * was actually written, quotes included — which is what makes a template render
+ * back into a command that still means the same thing. Dropping the quotes turned
+ * `git commit -m "feat: x"` into `git commit -m feat: x`, and since `pi-tape run`
+ * executes what the template says, that is not a cosmetic loss.
+ */
+export interface ShellToken {
+	/** The spelling in the source, quotes included. */
+	raw: string;
+	/** The unquoted content. */
+	original: string;
+	/** The quote character that was used, when the token was quoted. */
+	quote?: string;
+}
+
+export function tokenizeShellDetailed(segment: string): ShellToken[] {
+	const tokens: ShellToken[] = [];
 	let current = "";
 	let quote: string | undefined;
+	let usedQuote: string | undefined;
+	let raw = "";
+
+	const flush = () => {
+		if (!current && !raw) return;
+		tokens.push(
+			usedQuote === undefined ? { raw: current, original: current } : { raw, original: current, quote: usedQuote },
+		);
+		current = "";
+		raw = "";
+		usedQuote = undefined;
+	};
 
 	for (const char of segment) {
 		if (quote) {
+			raw += char;
 			if (char === quote) quote = undefined;
 			else current += char;
 			continue;
 		}
 		if (char === '"' || char === "'") {
 			quote = char;
+			usedQuote = char;
+			raw += char;
 			continue;
 		}
 		if (/\s/.test(char)) {
-			if (current) tokens.push(current);
-			current = "";
+			flush();
 			continue;
 		}
 		current += char;
+		raw += char;
 	}
-	if (current) tokens.push(current);
+	flush();
 	return tokens;
 }
 
@@ -270,16 +344,41 @@ export function isNoiseCommand(normalized: string): boolean {
 interface TokenResult {
 	text: string;
 	replaced?: string;
+	secret?: { label: string; prefix: string; suffix: string };
 }
 
 /** Replace the recording-specific part of one token, or keep it verbatim. */
 function normalizeToken(token: string): TokenResult {
 	if (!token) return { text: "" };
 
+	// A credential is not a value the recipe may keep, so it is checked before any
+	// other rule and the surrounding scaffolding is preserved: `curl -H
+	// 'Authorization: Bearer <token>'` must still read as an authorization header.
+	const secret = secretLabelOf(token);
+	if (secret) {
+		const span = findSecret(token);
+		if (span) {
+			const prefix = token.slice(0, span.start);
+			const suffix = token.slice(span.end);
+			return { text: `${prefix}${WILDCARD}${suffix}`, replaced: token, secret: { label: span.label, prefix, suffix } };
+		}
+	}
+
 	// A shell variable is environment-specific by definition. Normalizing it to the
 	// same wildcard makes `ls $R/dist` and `ls $PKG/src` align.
-	if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(token) || /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/.test(token)) {
-		return { text: WILDCARD, replaced: token };
+	const variable = token.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/);
+	if (variable || /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/.test(token)) {
+		// A variable named for a credential is a secret *reference*: the name is kept
+		// (that is what has to be supplied), the value was never in this command.
+		const name = variable?.[1];
+		return {
+			text: WILDCARD,
+			replaced: token,
+			secret:
+				name && isSecretVariableName(name)
+					? { label: name.toLowerCase(), prefix: "", suffix: "" }
+					: undefined,
+		};
 	}
 
 	// Quoted content already lost its quotes in tokenizeShell.
@@ -334,6 +433,15 @@ interface PositionalRule {
 
 const POSITIONAL_RULES: PositionalRule[] = [
 	{
+		// pip install <pkg...>, python -m pip install <pkg>
+		test: (verb) => {
+			const [head, sub] = verb.split(" ");
+			if (head === "pip" || head === "pip3") return sub === "install";
+			return (head === "python" || head === "python3") && sub === "-m";
+		},
+		suggest: (argv, i) => (i >= 2 && argv[i - 1] === "install" && !argv[i]?.startsWith("-") ? "package" : undefined),
+	},
+	{
 		// npm install <pkg...>, npm i -D <pkg>
 		test: (verb) => {
 			const [head, sub] = verb.split(" ");
@@ -386,27 +494,63 @@ const POSITIONAL_RULES: PositionalRule[] = [
 	},
 ];
 
+/**
+ * Flags whose *following* token is the credential, when they are separate words.
+ *
+ * `--token abc` and `--token=abc` are the same act, and a value that does not
+ * look like a credential on its own (`npm_aaaa…` looks like any other word) can
+ * only be recognised by the flag that introduces it.
+ */
+const CREDENTIAL_FLAGS = new Set([
+	"--token",
+	"--password",
+	"--passwd",
+	"--secret",
+	"--api-key",
+	"--apikey",
+	"--auth",
+	"--credential",
+	"--credentials",
+]);
+
+function markCredentialArguments(tokens: AnalyzedToken[]): void {
+	for (let i = 1; i < tokens.length; i++) {
+		const flag = (tokens[i - 1] as AnalyzedToken).original.split("=")[0] as string;
+		if (!CREDENTIAL_FLAGS.has(flag)) continue;
+		const token = tokens[i] as AnalyzedToken;
+		if (token.original.startsWith("-")) continue;
+		token.secret = { label: flag.replace(/^--/, "").replace(/-/g, "_"), prefix: "", suffix: "" };
+		token.literal = token.original;
+		token.text = WILDCARD;
+	}
+}
+
 /** Attach position-derived slot names and literal marks to a segment's tokens. */
 function applyPositionalRules(verb: string, tokens: AnalyzedToken[]): void {
-	const argv = tokens.map((token) => token.raw);
+	const argv = tokens.map((token) => token.original);
 	for (const rule of POSITIONAL_RULES) {
 		if (!rule.test(verb)) continue;
 		for (let i = 0; i < tokens.length; i++) {
 			const suggested = rule.suggest(argv, i);
 			if (suggested === undefined) continue;
 			const token = tokens[i] as AnalyzedToken;
+			// A credential already owns its token; the shape of the surrounding command
+			// must not turn it into a generic argument and lose that it was a secret.
+			if (token.secret) continue;
 			token.suggested = suggested;
 			// The token has to become a *whole* wildcard, even when the tokenizer had
 			// already rewritten part of it. `vue@latest` normalizes to `vue@<*>` on its
 			// own, which would still differ from `react@<*>`; as the template argument
 			// of a create command it is one recording-specific value and must vanish.
-			if (/^[A-Za-z@~.][\w@./~-]*$/.test(token.raw)) {
-				token.literal = token.raw;
+			if (/^[A-Za-z@~.][\w@./~-]*$/.test(token.original)) {
+				token.literal = token.original;
 				token.text = WILDCARD;
 			}
 		}
 		break;
 	}
+
+	markCredentialArguments(tokens);
 }
 
 /** The leading verbs of a normalized command. */
@@ -469,9 +613,11 @@ export interface ActionShape {
 	template: string;
 	example: string;
 	/** The literal values behind the placeholders, in order. */
-	literals: Array<{ name: string; value: string }>;
+	literals: Array<{ name: string; value: string; secret?: boolean }>;
 	/** True for pure reconnaissance commands (ls, echo, git status, ...). */
 	noise: boolean;
+	/** What kind of gap each placeholder is, when the shape can tell. */
+	slotKinds?: Record<string, GapKind>;
 }
 
 /**
@@ -488,8 +634,12 @@ export function shapeAction(toolName: string, args: Record<string, unknown>): Ac
 		const analyzed = analyzeCommand(args.command);
 		const { template, slots } = renderTemplate(
 			analyzed,
-			(token, occurrence) => token.suggested ?? `arg${occurrence + 1}`,
+			(token, occurrence) => (token.secret ? token.secret.label : token.suggested ?? `arg${occurrence + 1}`),
 		);
+		const slotKinds: Record<string, GapKind> = {};
+		for (const slot of slots) {
+			slotKinds[slot.name] = slot.secret ? "secret" : classifyGapKind({ name: slot.name, value: slot.value });
+		}
 		return {
 			key: `bash::${analyzed.key}`,
 			verb: analyzed.verb || "bash",
@@ -497,6 +647,7 @@ export function shapeAction(toolName: string, args: Record<string, unknown>): Ac
 			template,
 			example: args.command,
 			literals: slots,
+			slotKinds,
 			noise: isNoiseCommand(analyzed.key),
 		};
 	}
@@ -511,6 +662,7 @@ export function shapeAction(toolName: string, args: Record<string, unknown>): Ac
 			template: `${toolName} {{path}}`,
 			example: `${toolName} ${path}`,
 			literals: [{ name: "path", value: path }],
+			slotKinds: { path: classifyGapKind({ name: "path", value: path }) },
 			noise: kind === "read" && (category === "docs" || category === "other"),
 		};
 	}

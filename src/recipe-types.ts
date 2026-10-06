@@ -12,9 +12,13 @@
  * can be aligned. Everything literal lives in `template`.
  */
 
+import type { GapKind } from "./redact.ts";
+
 export const RECIPE_MAGIC = "pi-tape-recipe";
 export const RECIPE_VERSION = 1;
 export const RECIPE_EXTENSION = ".recipe.json";
+
+export type { GapKind };
 
 export type RecipeScope = "global" | "project";
 
@@ -43,6 +47,11 @@ export interface Step {
 	 * recordings differ but not what they differed by.
 	 */
 	slotValues: Record<string, string>;
+	/**
+	 * What kind of gap each placeholder is, by slot name. A credential is never
+	 * inlined, however consistently the recordings agreed on it.
+	 */
+	slotKinds?: Record<string, GapKind>;
 	/** Pure reconnaissance rather than part of the procedure. */
 	noise: boolean;
 }
@@ -73,6 +82,8 @@ export interface Slot {
 	description: string;
 	/** Fraction of recordings in the family that varied at this position. */
 	variance: number;
+	/** What kind of thing this slot holds, and therefore how to fill it. */
+	kind: GapKind;
 	fillers: Filler[];
 }
 
@@ -88,6 +99,12 @@ export interface Slot {
 export interface Parameter {
 	name: string;
 	description: string;
+	/**
+	 * What kind of gap this parameter is. `choice` when several slots have to move
+	 * together; otherwise the kind of its single member, so a caller can tell a
+	 * secret from a path from a project name without reading the step.
+	 */
+	kind: GapKind;
 	/** Positional slots belonging to this parameter, as `step index # slot`. */
 	members: Array<{ stepIndex: number; slot: string }>;
 	/**
@@ -120,6 +137,66 @@ export interface Compatibility {
 	constraints: string[];
 }
 
+/**
+ * A condition a fragment needs or delivers.
+ *
+ * `target` may still contain `{{slot}}` placeholders when it was derived from a
+ * parameterized recipe; linking uses the concrete form, this form is for reading.
+ */
+export interface Condition {
+	kind: "file" | "dir" | "command" | "dependency" | "image";
+	target: string;
+	/** Which step produced the condition, for a report a human can act on. */
+	note?: string;
+}
+
+/**
+ * What a fragment needs before it can run and what it leaves behind.
+ *
+ * This is the part that makes composition checkable: "take part A and part B" is
+ * only meaningful if something can say whether B's requirements meet A's results.
+ */
+export interface Contracts {
+	requires: Condition[];
+	provides: Condition[];
+}
+
+/** How a recording ended, and why the recipe may say so. */
+export type OutcomeStatus = "success" | "failed" | "mixed" | "unknown";
+
+export interface RecipeOutcome {
+	status: OutcomeStatus;
+	/** Recordings that ended successfully. */
+	successes: number;
+	/** Recordings that ended unsuccessfully and were kept out of the skeleton. */
+	failures: number;
+	evidence: string[];
+}
+
+/**
+ * A range of a recipe's steps with an intent: the unit that can be carried from
+ * one composition into another.
+ *
+ * Steps are tool calls, which is the right unit for aligning recordings and the
+ * wrong unit for reuse. `intent` is the only judgement here, and it is supplied
+ * rather than guessed.
+ */
+export interface Segment {
+	name: string;
+	/** One line on what this piece is for. */
+	intent: string;
+	/** Inclusive step indices in the source recipe. */
+	from: number;
+	to: number;
+	/** Name of the recipe this was cut from. */
+	source: string;
+	steps: Step[];
+	slots: Slot[];
+	parameters: Parameter[];
+	contracts: Contracts;
+	outcome: RecipeOutcome;
+}
+
 export interface Recipe {
 	magic: typeof RECIPE_MAGIC;
 	version: typeof RECIPE_VERSION;
@@ -141,6 +218,10 @@ export interface Recipe {
 	parameters: Parameter[];
 	compatibility: Compatibility;
 	validators: Validator[];
+	/** What the procedure needs and delivers, for composition. */
+	contracts: Contracts;
+	/** How the recordings behind this recipe ended. Success is never assumed. */
+	outcome: RecipeOutcome;
 	/** Cluster id assigned by the graph, if it has been indexed. */
 	cluster?: number;
 }
@@ -181,6 +262,14 @@ export interface RecipeIndex {
 	};
 }
 
+export function emptyOutcome(): RecipeOutcome {
+	return { status: "unknown", successes: 0, failures: 0, evidence: [] };
+}
+
+export function emptyContracts(): Contracts {
+	return { requires: [], provides: [] };
+}
+
 export function emptyRecipe(name: string, scope: RecipeScope): Recipe {
 	const now = new Date().toISOString();
 	return {
@@ -200,5 +289,7 @@ export function emptyRecipe(name: string, scope: RecipeScope): Recipe {
 		parameters: [],
 		compatibility: { constraints: [] },
 		validators: [],
+		contracts: emptyContracts(),
+		outcome: emptyOutcome(),
 	};
 }

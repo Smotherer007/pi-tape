@@ -11,11 +11,13 @@
  * recipe.
  */
 
-import type { Recipe, Step, Slot, StepKind } from "./recipe-types.ts";
+import type { Recipe, Step, Slot, StepKind, GapKind } from "./recipe-types.ts";
 import { emptyRecipe } from "./recipe-types.ts";
 import { resolveEntries } from "./tape.ts";
 import { messageOf, toolCallsOf } from "./session.ts";
 import { analyzeCommand, renderTemplate, categorizeFile, shapeAction, tokenizeShell } from "./normalize.ts";
+import { classifyGapKind, redactText } from "./redact.ts";
+import { contractsOfSteps } from "./contract.ts";
 import type { SessionEntry, TapeFile } from "./types.ts";
 
 /** Verbs that scaffold a new project, where a trailing bare argument is its name. */
@@ -39,9 +41,15 @@ export interface ExtractResult {
 /** Guess a slot name from what was replaced and where. */
 export function proposeSlotName(verb: string, literal: string, command: string): string {
 	const tokens = tokenizeShell(command);
+	const index = tokens.indexOf(literal);
+	const previous = index > 0 ? tokens[index - 1] : undefined;
 
 	// `git checkout -b feat/x` -> branch
-	if (/(-b|--branch)$/.test(tokens[tokens.indexOf(literal) - 1] ?? "")) return "branch";
+	if (/(-b|--branch)$/.test(previous ?? "")) return "branch";
+
+	// A long flag names its own value better than the value's content can:
+	// `--port 8000` is a port, not an id, and a port belongs to the environment.
+	if (previous && /^--[a-z][\w-]*$/.test(previous)) return previous.replace(/^--/, "").replace(/-/g, "_");
 
 	if (/^v?\d+\.\d+/.test(literal)) return "version";
 	if (literal.includes("/") || literal.startsWith(".") || literal.startsWith("~")) return "path";
@@ -72,11 +80,18 @@ function makeUnique(base: string, used: Set<string>): string {
 	return `${base}${n}`;
 }
 
+/** One slot a step exposes, with what kind of gap it is. */
+interface BuiltSlot {
+	name: string;
+	value: string;
+	kind: GapKind;
+}
+
 /** Build the step and slot candidates for one recorded tool call. */
 function buildStep(
 	toolName: string,
 	args: Record<string, unknown>,
-): { step: Step; slots: Array<{ name: string; value: string }> } {
+): { step: Step; slots: BuiltSlot[] } {
 	const shaped = shapeAction(toolName, args);
 
 	if (shaped.kind === "command" && typeof args.command === "string") {
@@ -84,7 +99,12 @@ function buildStep(
 		const used = new Set<string>();
 		const named = new Map<string, string>();
 
-		const { template, slots } = renderTemplate(analyzed, (token, occurrence) => {
+		const { template, slots: rendered } = renderTemplate(analyzed, (token, occurrence) => {
+			// A credential owns its own slot and is never merged with another one:
+			// two different tokens redact to the same marker, and pretending they were
+			// one value would hide that two secrets are involved.
+			if (token.secret) return makeUnique(token.secret.label, used);
+
 			const literal = token.literal ?? "";
 			// Identical literals in one command share a slot; that is what makes
 			// `cp a a` and `cp a b` differ in the right place.
@@ -97,31 +117,43 @@ function buildStep(
 			return name;
 		});
 
+		const slots: BuiltSlot[] = rendered.map((slot) => ({
+			name: slot.name,
+			value: slot.value,
+			kind: slot.secret ? "secret" : classifyGapKind({ name: slot.name, value: slot.value }),
+		}));
+
 		const step: Step = {
 			key: shaped.key,
 			verb: shaped.verb,
 			kind: "command",
 			template,
-			example: shaped.example,
+			// The example is shown to humans and stored in a shared file, so it is an
+			// output of the redaction pass like any other.
+			example: redactText(shaped.example),
 			usesSlots: [...new Set(slots.map((slot) => slot.name))],
 			slotValues: Object.fromEntries(slots.map((slot) => [slot.name, slot.value])),
+			slotKinds: Object.fromEntries(slots.map((slot) => [slot.name, slot.kind])),
 			noise: shaped.noise,
 		};
 		return { step, slots };
 	}
 
 	const isFileStep = shaped.kind === "read" || shaped.kind === "write" || shaped.kind === "edit";
+	const path = shaped.literals[0]?.value;
+	const kind: GapKind = isFileStep && path !== undefined ? classifyGapKind({ name: "path", value: path }) : "free";
 	const step: Step = {
 		key: shaped.key,
 		verb: shaped.verb,
 		kind: shaped.kind,
 		template: shaped.template,
-		example: shaped.example,
+		example: redactText(shaped.example),
 		usesSlots: isFileStep ? ["path"] : [],
-		slotValues: isFileStep && shaped.literals[0] ? { path: shaped.literals[0].value } : {},
+		slotValues: isFileStep && path !== undefined ? { path } : {},
+		slotKinds: isFileStep && path !== undefined ? { path: kind } : {},
 		noise: shaped.noise,
 	};
-	return { step, slots: shaped.literals };
+	return { step, slots: isFileStep && path !== undefined ? [{ name: "path", value: path, kind }] : [] };
 }
 
 /**
@@ -218,6 +250,7 @@ export function extractRecipe(tape: TapeFile, options: ExtractOptions = {}): Ext
 						description: `Values observed where the tape used "${slot.value}" in ${built.step.verb}`,
 						// A single recording cannot tell variance from noise.
 						variance: 0,
+						kind: slot.kind,
 						fillers: [
 							{
 								value: slot.value,
@@ -235,6 +268,17 @@ export function extractRecipe(tape: TapeFile, options: ExtractOptions = {}): Ext
 	recipe.slots = [...slotsByName.values()];
 	recipe.validators = deriveValidators(commands);
 	recipe.observations = 1;
+
+	// Contracts and outcome are derived from the recording, so a recipe can be
+	// linked and trusted without re-reading the tape it came from.
+	recipe.contracts = contractsOfSteps(recipe.steps.map((step) => step.template));
+	const status = tape.outcome?.status ?? "unknown";
+	recipe.outcome = {
+		status,
+		successes: status === "success" ? 1 : 0,
+		failures: status === "failed" ? 1 : 0,
+		evidence: tape.outcome?.evidence ?? [],
+	};
 
 	const distinct = new Set(recipe.steps.map((step) => step.key)).size;
 	const meaningful = recipe.steps.filter((step) => !step.noise).length;

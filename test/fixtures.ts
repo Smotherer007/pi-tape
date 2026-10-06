@@ -133,6 +133,7 @@ export function toolResultEntry(
 	parentId: string | null,
 	toolName: string,
 	text: string,
+	isError = false,
 ): SessionEntry {
 	return entry({
 		type: "message",
@@ -143,7 +144,7 @@ export function toolResultEntry(
 			toolCallId: `call_${parentId}`,
 			toolName,
 			content: [{ type: "text", text }],
-			isError: false,
+			isError,
 			timestamp: 5,
 		},
 	});

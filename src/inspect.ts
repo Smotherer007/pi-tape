@@ -59,6 +59,14 @@ export function inspectTape(tape: TapeFile, options: InspectOptions = {}): strin
 	add(`╰─`);
 	add();
 
+	if (tape.outcome) {
+		// Whether a run achieved anything is not visible from its transcript, so the
+		// verdict and its reasons are stated rather than left to be inferred.
+		add(`Outcome: ${tape.outcome.status}${tape.outcome.declared ? " (declared)" : ""}`);
+		for (const evidence of tape.outcome.evidence) add(`  · ${evidence}`);
+		add();
+	}
+
 	if (tape.lossy && tape.dropped.length) {
 		add("Dropped while recording (playback is not bit-faithful):");
 		for (const item of tape.dropped) add(`  · ${item}`);

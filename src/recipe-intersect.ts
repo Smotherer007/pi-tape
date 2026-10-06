@@ -22,9 +22,12 @@
  *                   what makes "Vue -> React" a value change and not a rewrite.
  */
 
-import type { Parameter, Recipe, Slot, Step } from "./recipe-types.ts";
+import type { Parameter, Recipe, Slot, Step, GapKind } from "./recipe-types.ts";
 import { emptyRecipe } from "./recipe-types.ts";
 import { proposeSlotName, renameTemplate } from "./recipe-extract.ts";
+import { classifyGapKind, mustStayOpen } from "./redact.ts";
+import { contractsOfSteps } from "./contract.ts";
+import { combineOutcomes } from "./outcome.ts";
 
 /** Standard dynamic-programming LCS, returning matched index pairs. */
 export function lcsAlignment(a: string[], b: string[]): Array<[number, number]> {
@@ -90,6 +93,8 @@ export interface IntersectOptions {
 	minSupport?: number;
 	/** Keep reconnaissance steps in the skeleton. Off by default. */
 	includeNoise?: boolean;
+	/** Splice failed recordings too. Off by default: a failure is not knowledge. */
+	includeFailed?: boolean;
 }
 
 export interface IntersectResult {
@@ -104,6 +109,8 @@ export interface IntersectResult {
 	longestSteps: number;
 	/** Number of reconnaissance steps left out of the skeleton. */
 	noiseExcluded: number;
+	/** Ids of failed recordings kept out of the skeleton, counted but not learned from. */
+	excludedFailed: string[];
 }
 
 /** A recipe reduced to the steps that participate in alignment. */
@@ -134,11 +141,24 @@ function prepare(recipes: Recipe[], includeNoise: boolean): Prepared[] {
 	});
 }
 
-export function intersectRecipes(recipes: Recipe[], options: IntersectOptions = {}): IntersectResult {
-	if (recipes.length === 0) throw new Error("intersectRecipes needs at least one recipe");
+export function intersectRecipes(allRecipes: Recipe[], options: IntersectOptions = {}): IntersectResult {
+	if (allRecipes.length === 0) throw new Error("intersectRecipes needs at least one recipe");
 
 	const minSupport = options.minSupport ?? 0.6;
 	const includeNoise = options.includeNoise ?? false;
+
+	// A failed recording is evidence about what does *not* work, not about what the
+	// procedure is, so it is counted and reported but kept out of the skeleton.
+	const failed = options.includeFailed
+		? []
+		: allRecipes.filter((recipe) => recipe.outcome?.status === "failed");
+	const recipes = failed.length ? allRecipes.filter((recipe) => !failed.includes(recipe)) : allRecipes;
+	if (recipes.length === 0) {
+		throw new Error(
+			"every recording failed: a failed run is evidence about what does not work, not about the procedure — pass --include-failed to splice it anyway",
+		);
+	}
+
 	const prepared = prepare(recipes, includeNoise);
 	const sequences = prepared.map((item) => item.keys);
 
@@ -214,13 +234,21 @@ export function intersectRecipes(recipes: Recipe[], options: IntersectOptions = 
 
 		for (const [name, byValue] of perSlot) {
 			const values = [...byValue.keys()];
+			// What kind of gap this slot was, decided when the recording was extracted.
+			// A credential or a machine-specific path is not a constant merely because
+			// every recording agreed on it: inlining it would bake a secret into the
+			// recipe and make the procedure non-portable. Only ordinary knowledge folds in.
+			const kind: GapKind =
+				step.slotKinds?.[name] ?? classifyGapKind({ name, value: (values[0] as string) ?? "" });
 
 			// A slot with one observed value is a constant: inline it so the recipe
-			// stays as concrete as it can be.
-			if (values.length === 1) {
+			// stays as concrete as it can be. Unless the value is one that must stay
+			// open — agreement about a credential or a machine path is not knowledge.
+			if (values.length === 1 && !mustStayOpen(kind, values[0] as string)) {
 				step.template = step.template.replaceAll(`{{${name}}}`, values[0] as string);
 				step.usesSlots = step.usesSlots.filter((slot) => slot !== name);
 				delete step.slotValues[name];
+				if (step.slotKinds) delete step.slotKinds[name];
 				continue;
 			}
 
@@ -252,6 +280,7 @@ export function intersectRecipes(recipes: Recipe[], options: IntersectOptions = 
 				stepKey: step.key,
 				description: `Varies across tapes at step "${step.verb}"`,
 				variance: 1 - (fillers[0]?.observedIn ?? 0) / k,
+				kind,
 				fillers,
 			});
 
@@ -266,6 +295,9 @@ export function intersectRecipes(recipes: Recipe[], options: IntersectOptions = 
 			step.template = renameTemplate(step.template, mapping);
 			step.slotValues = Object.fromEntries(
 				Object.entries(step.slotValues).map(([name, value]) => [mapping[name] ?? name, value]),
+			);
+			step.slotKinds = Object.fromEntries(
+				Object.entries(step.slotKinds ?? {}).map(([name, kind]) => [mapping[name] ?? name, kind]),
 			);
 			step.usesSlots = step.usesSlots.map((name) => mapping[name] ?? name);
 		}
@@ -301,6 +333,20 @@ export function intersectRecipes(recipes: Recipe[], options: IntersectOptions = 
 	merged.orthogonality = longestSteps ? skeleton.length / longestSteps : 0;
 	merged.compatibility.constraints = mergeConstraints(recipes);
 	merged.validators = dedupeValidators(recipes);
+	merged.contracts = contractsOfSteps(skeleton.map((step) => step.template));
+
+	const combined = combineOutcomes(
+		allRecipes.map((recipe) => recipe.outcome),
+		failed.length
+			? [`${failed.length} failed recording(s) excluded from the skeleton: ${failed.map((r) => r.name).join(", ")}`]
+			: [],
+	);
+	merged.outcome = {
+		status: combined.status,
+		successes: combined.successes,
+		failures: combined.failures,
+		evidence: combined.evidence,
+	};
 
 	return {
 		recipe: merged,
@@ -310,6 +356,7 @@ export function intersectRecipes(recipes: Recipe[], options: IntersectOptions = 
 		sharedSteps: skeleton.length,
 		longestSteps,
 		noiseExcluded: prepared.reduce((sum, item) => sum + item.noise, 0),
+		excludedFailed: failed.map((recipe) => recipe.id),
 	};
 }
 
@@ -417,8 +464,17 @@ export function groupCoVaryingSlots(
 		if (variants.size < 2) continue;
 
 		const verbs = [...new Set(members.map((member) => (skeleton[member.stepIndex] as Step)?.verb ?? "?"))];
+		const firstMember = ordered[0] as { stepIndex: number; slot: string };
+		// A parameter with several members is a `choice`: the values have to move
+		// together or not at all. A single member keeps the kind of its slot, so a
+		// caller can tell a secret from a path without reading the step.
+		const kind: GapKind =
+			members.length > 1
+				? "choice"
+				: ((skeleton[firstMember.stepIndex] as Step)?.slotKinds?.[firstMember.slot] ?? "free");
 		parameters.push({
 			name,
+			kind,
 			description:
 				members.length > 1
 					? `Co-varies across ${members.length} slots in: ${verbs.join(", ")}`

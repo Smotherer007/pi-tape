@@ -17,6 +17,8 @@ import { join } from "node:path";
 import { agentDir } from "./discover.ts";
 import { stableStringify } from "./hash.ts";
 import {
+	emptyContracts,
+	emptyOutcome,
 	RECIPE_EXTENSION,
 	RECIPE_MAGIC,
 	RECIPE_VERSION,
@@ -61,9 +63,18 @@ export function recipeId(recipe: Recipe): string {
 	const payload = stableStringify({
 		name: recipe.name,
 		scope: recipe.scope,
-		steps: recipe.steps.map((step) => ({ key: step.key, template: step.template })),
-		slots: recipe.slots.map((slot) => ({ name: slot.name, stepIndex: slot.stepIndex, fillers: slot.fillers.map((f) => f.value) })),
-		parameters: recipe.parameters.map((parameter) => ({ name: parameter.name, variants: parameter.variants.map((v) => v.label) })),
+		steps: recipe.steps.map((step) => ({ key: step.key, template: step.template, slotKinds: step.slotKinds ?? {} })),
+		slots: recipe.slots.map((slot) => ({
+			name: slot.name,
+			stepIndex: slot.stepIndex,
+			kind: slot.kind,
+			fillers: slot.fillers.map((f) => f.value),
+		})),
+		parameters: recipe.parameters.map((parameter) => ({
+			name: parameter.name,
+			kind: parameter.kind,
+			variants: parameter.variants.map((v) => v.label),
+		})),
 	});
 	return `recipe:${createHash("sha256").update(payload).digest("hex").slice(0, 32)}`;
 }
@@ -128,7 +139,26 @@ export function validateRecipe(value: unknown, path: string): Recipe {
 		if (typeof parameter.enumerated !== "boolean") {
 			parameter.enumerated = Array.isArray(parameter.members) && parameter.members.length > 1;
 		}
+		// Recipes written before gap kinds existed: a multi-member parameter was a
+		// choice, anything else was free. Assuming more than that would invent
+		// information the file never carried.
+		if (typeof parameter.kind !== "string") {
+			parameter.kind = parameter.enumerated ? "choice" : "free";
+		}
 	}
+
+	for (const slot of recipe.slots) {
+		if (typeof slot.kind !== "string") slot.kind = "free";
+	}
+	for (const step of recipe.steps) {
+		if (step.slotKinds === undefined || typeof step.slotKinds !== "object") step.slotKinds = {};
+	}
+
+	if (!recipe.contracts || typeof recipe.contracts !== "object") recipe.contracts = emptyContracts();
+	if (!Array.isArray(recipe.contracts.requires)) recipe.contracts.requires = [];
+	if (!Array.isArray(recipe.contracts.provides)) recipe.contracts.provides = [];
+	if (!recipe.outcome || typeof recipe.outcome !== "object") recipe.outcome = emptyOutcome();
+	if (!Array.isArray(recipe.outcome.evidence)) recipe.outcome.evidence = [];
 
 	return recipe as Recipe;
 }

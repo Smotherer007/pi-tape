@@ -12,9 +12,10 @@
  * camelCase/snake_case tokenization and a substring bonus, no scikit-learn.
  */
 
-import type { Parameter, Recipe, Step } from "./recipe-types.ts";
+import type { GapKind, Parameter, Recipe, Step } from "./recipe-types.ts";
 import type { RecipeGraph } from "./graph.ts";
 import { recipeNodeId, stepNodeId } from "./graph.ts";
+import { gapHint } from "./redact.ts";
 
 /** Approximate tokens per character, the usual conservative estimate. */
 export const CHARS_PER_TOKEN = 4;
@@ -47,12 +48,15 @@ function documentOf(recipe: Recipe): string {
 		parts.push(...step.usesSlots);
 	}
 	for (const slot of recipe.slots) {
-		parts.push(slot.name, slot.description);
+		parts.push(slot.name, slot.kind, slot.description);
 		parts.push(...slot.fillers.map((filler) => filler.value));
 	}
 	for (const parameter of recipe.parameters) {
-		parts.push(parameter.name, parameter.description);
+		parts.push(parameter.name, parameter.kind, parameter.description);
 		parts.push(...parameter.variants.map((variant) => variant.label));
+	}
+	for (const condition of [...recipe.contracts.requires, ...recipe.contracts.provides]) {
+		parts.push(condition.kind, condition.target);
 	}
 	parts.push(...recipe.validators.map((validator) => validator.command));
 	parts.push(...recipe.compatibility.constraints);
@@ -193,12 +197,15 @@ function renderHit(hit: QueryHit, graph?: RecipeGraph): string {
 	lines.push(`### ${recipe.name} (${recipe.scope}, ${recipe.observations} observation${recipe.observations === 1 ? "" : "s"}, score ${hit.score})`);
 	if (recipe.description) lines.push(recipe.description);
 	lines.push(`orthogonality: ${(recipe.orthogonality * 100).toFixed(0)}% · steps: ${recipe.steps.length} · slots: ${recipe.slots.length}`);
+	if (recipe.outcome.status === "failed" || recipe.outcome.failures > 0) {
+		lines.push(`outcome: ${recipe.outcome.status} (${recipe.outcome.successes} ok, ${recipe.outcome.failures} failed)`);
+	}
 
 	if (recipe.parameters.length) {
 		lines.push("parameters:");
 		for (const parameter of recipe.parameters) {
 			const variants = parameter.variants.map((variant) => `${variant.label} (x${variant.observedIn})`).join(", ");
-			lines.push(`  ${parameter.name}: ${variants}`);
+			lines.push(`  ${parameter.name} [${parameter.kind}]: ${variants}`);
 		}
 	}
 
@@ -331,6 +338,66 @@ export function missingInputs(steps: string[]): string[] {
 		for (const match of step.matchAll(/\{\{(\w+)\}\}/g)) missing.add(match[1] as string);
 	}
 	return [...missing];
+}
+
+/** A placeholder that is still open, with what kind of gap it is. */
+export interface UnfilledGap {
+	name: string;
+	kind: GapKind;
+	hint: string;
+}
+
+/** The order in which kinds are worth reporting, most consequential first. */
+const KIND_PRIORITY: GapKind[] = ["secret", "path", "env", "choice", "free"];
+
+/**
+ * What a composed recipe still needs, and what kind of thing each gap is.
+ *
+ * This is the difference between "fill in `{{token}}`" and "this is a credential,
+ * it was redacted on purpose, supply it yourself". Same placeholder, different job.
+ */
+export function unfilledGaps(recipe: Recipe, steps: string[]): UnfilledGap[] {
+	const kinds = new Map<string, GapKind>();
+	const record = (name: string, kind: GapKind) => {
+		const existing = kinds.get(name);
+		if (existing === undefined || KIND_PRIORITY.indexOf(kind) < KIND_PRIORITY.indexOf(existing)) {
+			kinds.set(name, kind);
+		}
+	};
+
+	for (const step of recipe.steps) {
+		for (const [name, kind] of Object.entries(step.slotKinds ?? {})) record(name, kind);
+	}
+	for (const slot of recipe.slots) record(slot.name, slot.kind);
+
+	// A slot belonging to an enumerated parameter cannot be filled on its own: the
+	// whole point of the group is that the values move together, so the instruction
+	// has to be "set the parameter", not "supply this placeholder".
+	const grouped = new Map<string, { parameter: string; options: string[] }>();
+	for (const parameter of recipe.parameters) {
+		if (parameter.enumerated) {
+			const options = parameter.variants.map((variant) => variant.label);
+			for (const member of parameter.members) {
+				record(member.slot, "choice");
+				grouped.set(member.slot, { parameter: parameter.name, options });
+			}
+			continue;
+		}
+		const member = parameter.members[0];
+		if (member) record(member.slot, parameter.kind);
+	}
+
+	return missingInputs(steps).map((name) => {
+		const kind = kinds.get(name) ?? "free";
+		const group = grouped.get(name);
+		return {
+			name,
+			kind,
+			hint: group
+				? `part of parameter "${group.parameter}": choose one of ${group.options.join(", ")}`
+				: gapHint(kind, name),
+		};
+	});
 }
 
 export { recipeNodeId, stepNodeId };
