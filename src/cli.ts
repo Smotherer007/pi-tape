@@ -983,6 +983,16 @@ function cmdExtension(): void {
 // ---------------------------------------------------------------------------
 
 function main(): void {
+	// `pi-tape library | head -3` closes the pipe early, and node turns that into an
+	// unhandled error with a stack trace. A consumer that stopped reading is not a
+	// failure; anything else still is.
+	for (const stream of [process.stdout, process.stderr]) {
+		stream.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "EPIPE") process.exit(0);
+			throw error;
+		});
+	}
+
 	const [command, ...rest] = process.argv.slice(2);
 	const args = parseArgs(rest);
 
