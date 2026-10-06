@@ -118,6 +118,26 @@ export class ReplayEngine {
 		}
 	}
 
+	/**
+	 * The recorded answer a request would be served, *without* consuming it.
+	 *
+	 * This exists so a shadow run can compare the recording with what a different
+	 * model says about the same request, while the recording is still served as
+	 * usual: the run has to follow the recorded trajectory, or the later requests
+	 * would stop lining up with it.
+	 */
+	peekAssistant(prefixEntries: SessionEntry[], context: HashContext = {}): SessionEntry | undefined {
+		const hash = this.hashOf(prefixEntries, context);
+		const byHash = this.assistants.find((item) => item.hash === hash);
+		if (byHash) return byHash.entry;
+		return this.assistants.find((item) => !this.consumedAssistants.has(item.index))?.entry;
+	}
+
+	/** Total recorded assistant events, for progress reporting. */
+	get assistantCount(): number {
+		return this.assistants.length;
+	}
+
 	/** Recorded assistant message whose request prefix matches `prefixEntries`. */
 	nextAssistant(prefixEntries: SessionEntry[], context: HashContext = {}): ReplayOutcome {
 		const hash = this.hashOf(prefixEntries, context);
