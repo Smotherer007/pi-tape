@@ -28,13 +28,34 @@ import { condition, deriveConditions, type DeriveOptions, type Segment } from ".
 
 export type StepContractOptions = DeriveOptions;
 
-/** Fold the conditions of many steps into one contract, preserving step order. */
+/**
+ * Fold the conditions of many steps into one contract, preserving step order.
+ *
+ * Deduplicated per list: `npm install a` and `npm run build` both need `npm`, and a
+ * contract that says "needs command npm" twice reads like two different
+ * requirements. The first note wins, so a condition keeps the step that introduced
+ * it as its provenance. Requires and provides are deduplicated separately, because
+ * a step may legitimately sit on both sides.
+ */
 export function contractsOfSteps(steps: string[], options: DeriveOptions = {}): Contracts {
 	const out = emptyContracts();
+	const seenRequires = new Set<string>();
+	const seenProvides = new Set<string>();
+
 	for (const step of steps) {
 		const conditions = stepConditions(step, options);
-		out.requires.push(...conditions.requires);
-		out.provides.push(...conditions.provides);
+		for (const condition of conditions.requires) {
+			const key = `${condition.kind} ${condition.target}`;
+			if (seenRequires.has(key)) continue;
+			seenRequires.add(key);
+			out.requires.push(condition);
+		}
+		for (const condition of conditions.provides) {
+			const key = `${condition.kind} ${condition.target}`;
+			if (seenProvides.has(key)) continue;
+			seenProvides.add(key);
+			out.provides.push(condition);
+		}
 	}
 	return out;
 }

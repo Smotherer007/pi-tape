@@ -315,6 +315,12 @@ verify    check the postconditions the steps claimed they would deliver
 pi-tape run service --set package=fastapi --set port=8000
 ```
 
+An explicit `--set` for a slot name beats the variant a parameter would have chosen,
+and that order is deliberate in the other direction too: a parameter is a *guess*
+that its members move together, and with a thin family that guess can swallow a slot
+the caller named. Silently ignoring what the caller asked for is the one outcome
+that is always wrong.
+
 Printing the plan is the default and executing is `--yes`, because a recipe is a
 recorded command line and running one runs whatever it says. A chain is refused
 before anything happens when it has unfilled gaps, unmet requirements from `link`,

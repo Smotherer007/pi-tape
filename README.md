@@ -74,14 +74,20 @@ instead of accumulating. Details in [docs/RECIPES.md](docs/RECIPES.md).
 ## Install
 
 Requires Node **22.18.0+** — the first 22.x that runs TypeScript without a flag,
-which is why it is the declared floor. Node 24 and 26 are tested as well. No build
-step.
+which is why it is the declared floor. Node 24 and 26 are tested as well.
 
 As a pi package:
 
 ```bash
 pi install npm:@patimweb/pi-tape
 ```
+
+The published package ships a compiled `dist/` next to the TypeScript sources, and
+both entry points — the `pi-tape` binary and the extension — point at the compiled
+files. That is not decoration: node refuses to strip types for anything under
+`node_modules`, so a package whose `bin` is a `.ts` file dies on its first line for
+everybody who installs it. The sources are still shipped, because they are worth
+reading and because pi loads TypeScript extensions fine from a checkout.
 
 From a checkout:
 
@@ -359,8 +365,9 @@ A debugger that lies is worse than none, so:
 ## Development
 
 ```bash
-npm test                    # 141 tests, no build step
+npm test                    # 146 tests
 npm run typecheck           # tsc --noEmit, clean
+npm run build               # tsc -p tsconfig.build.json -> dist/ (needed only to publish)
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library
 ```
 
@@ -428,8 +435,9 @@ Add it under Settings → Secrets and variables → Actions. `GITHUB_TOKEN` is p
 automatically.
 
 What ships is small on purpose: `files` is an allowlist, so the tarball holds the
-sources, the extension, the docs and the licence and nothing else — no tests, no
-workflows, no dev tooling. `typebox` is the only runtime dependency, which means the
+compiled `dist/`, the sources, the extension, the docs and the licence and nothing
+else — no tests, no workflows, no dev tooling. `dist/` is built by
+`prepublishOnly`, so publishing without compiling is not possible. `typebox` is the only runtime dependency, which means the
 published package has no vulnerable transitive dependencies even though the dev tree
 has some from semantic-release. `npm audit --omit=dev` reports zero.
 

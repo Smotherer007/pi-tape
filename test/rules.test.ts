@@ -30,9 +30,14 @@ const testSource = (name: string): string => readFileSync(join(here, name), "utf
  * somebody deletes.
  */
 function code(name: string): string {
-	return source(name)
-		.replace(/\/\*[\s\S]*?\*\//g, "")
-		.replace(/^\s*\/\/.*$/gm, "");
+	return (
+		source(name)
+			// Only a block comment that *starts* its line, because a glob such as
+			// `src/**/*.ts` contains `/**/` and a blanked-out glob is a blanked-out
+			// guard: the check would pass on code it never read.
+			.replace(/^\s*\/\*[\s\S]*?\*\//gm, "")
+			.replace(/^\s*\/\/.*$/gm, "")
+	);
 }
 
 /** Every ecosystem noun that must not appear in the engine. */
