@@ -6,7 +6,7 @@
 import type { TapeFile, SessionEntry } from "./types.ts";
 import { contextHogs, toolWeights } from "./stats.ts";
 import { formatBytes, resolveEntries } from "./tape.ts";
-import { verifyRecording } from "./replay.ts";
+import { ReplayEngine, verifyRecording } from "./replay.ts";
 import { contentBlocks, messageOf, toolCallsOf } from "./session.ts";
 
 function preview(entry: SessionEntry, width = 72): string {
@@ -133,8 +133,23 @@ export function inspectTape(tape: TapeFile, options: InspectOptions = {}): strin
 			const calls = toolCallsOf(entry);
 			const suffix = calls.length ? ` [${calls.map((call) => call.name).join(", ")}]` : "";
 			add(`  ${entry.id}  ${role.padEnd(10)} ${preview(entry, 56)}${suffix}`);
-		}
+			}
 		add();
+
+		// Where a fork can intervene, numbered the way `--at` accepts: `--at 2` is the
+		// second line here, `--at call_abc` is the id at the end of it.
+		const points = new ReplayEngine(tape).toolCallPoints();
+		if (points.length) {
+			add("Intervention points (`/tape fork … --at <turn|toolCallId> --result …`)");
+			for (const point of points) {
+				const args = JSON.stringify(point.arguments ?? {});
+				const shown = args.length > 46 ? `${args.slice(0, 45)}…` : args;
+				add(
+					`  turn ${String(point.turn).padStart(2)}  ${point.toolName.padEnd(10)} ${shown.padEnd(46)} ${point.toolCallId}${point.hasResult ? "" : " (no recorded result)"}`,
+				);
+			}
+			add();
+		}
 	}
 
 	return lines.join("\n");

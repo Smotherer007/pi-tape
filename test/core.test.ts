@@ -365,6 +365,106 @@ test("status tracks consumption and completion", () => {
 	assert.equal(before.finished, false);
 });
 
+test("the engine exposes the recorded tool calls as addressable turn points", () => {
+	const { tape } = recordSession(parseSession(buildFixture().text));
+	const engine = new ReplayEngine(tape);
+
+	const points = engine.toolCallPoints();
+	assert.equal(points.length, 1, "the fixture records one tool call");
+	assert.equal(points[0]?.turn, 1, "turns are 1-based, because `--at 1` is what a person types");
+	assert.equal(points[0]?.toolName, "read");
+	assert.deepEqual(points[0]?.arguments, { path: "a.txt" });
+	assert.equal(points[0]?.hasResult, true);
+});
+
+test("a tool result can be replaced, and the replacement is what a fork sees", () => {
+	const { tape } = recordSession(parseSession(buildFixture().text));
+	const engine = new ReplayEngine(tape);
+	const call = engine.toolCallPoints()[0];
+	assert.ok(call);
+
+	assert.equal(engine.toolResultOverride(call.toolCallId), undefined, "nothing is replaced until asked");
+	engine.setToolResultOverride(call.toolCallId, [{ type: "text", text: "REPLACED" }]);
+
+	assert.deepEqual(engine.toolResultOverride(call.toolCallId), [{ type: "text", text: "REPLACED" }]);
+	assert.deepEqual(engine.toolResultOverrides(), [
+		{ toolCallId: call.toolCallId, content: [{ type: "text", text: "REPLACED" }] },
+	]);
+	assert.equal(engine.toolResultOverride("call_never_recorded"), undefined);
+});
+
+test("a live tool call that repeats the recorded one is served from the recording", () => {
+	const { tape } = recordSession(parseSession(buildFixture().text));
+	const engine = new ReplayEngine(tape);
+	const call = engine.toolCallPoints()[0];
+	assert.ok(call);
+
+	// What a fork's live branch produces: the same tool, the same arguments, a new id.
+	const reconnected = engine.matchRecordedCall(call.toolName, call.arguments);
+	assert.equal(reconnected.kind, "hit");
+	if (reconnected.kind === "hit") {
+		assert.equal(reconnected.via, "reconnect");
+		assert.equal(
+			String((messageOf(reconnected.entry)?.content as Array<{ text?: string }> | undefined)?.[0]?.text),
+			"alpha",
+			"the recorded result is what a live branch gets back",
+		);
+	}
+
+	// Consumed once, and only for the call it actually was.
+	assert.equal(engine.matchRecordedCall(call.toolName, call.arguments).kind, "miss");
+	const other = new ReplayEngine(tape);
+	assert.equal(other.matchRecordedCall(call.toolName, { path: "somewhere-else.txt" }).kind, "miss");
+	assert.equal(other.matchRecordedCall("bash", call.arguments).kind, "miss");
+});
+
+test("a tool the recording never used can never reconnect", () => {
+	const { tape } = recordSession(parseSession(buildFixture().text));
+	const engine = new ReplayEngine(tape);
+	assert.equal(engine.matchRecordedCall("write", { path: "a.txt" }).kind, "miss");
+});
+
+test("a forked recording carries where it came from, and diff says so", () => {
+	const session = parseSession(buildFixture().text);
+	const origin = recordSession(session, { name: "origin" });
+
+	const forked = recordSession(session, {
+		name: "forked",
+		parent: {
+			tapeId: origin.tape.id,
+			forkPoint: { toolCallId: "call_a0003", toolName: "read", turn: 1, replacement: "REPLACED" },
+			liveRequests: 2,
+			reconnected: 1,
+		},
+	});
+
+	assert.equal(forked.tape.parent?.tapeId, origin.tape.id);
+	assert.equal(forked.tape.parent?.forkPoint?.replacement, "REPLACED");
+	assert.equal(origin.tape.parent, undefined, "a recording that is not a fork says nothing about a parent");
+
+	const report = diffTapes(origin.tape, forked.tape);
+	assert.equal(report.parent?.tapeId, origin.tape.id, "the fork relation is reported, not inferred by the reader");
+
+	const text = formatDiff(report);
+	assert.match(text, /right was forked from left/);
+	assert.match(text, /fork point {2}read turn 1 \(call_a0003\)/);
+	assert.match(text, /replaced {4}"REPLACED"/);
+	assert.match(text, /2 request\(s\) asked of a provider · 1 live call\(s\) answered from the recording/);
+});
+
+test("a diff of two unrelated recordings claims no parent", () => {
+	const session = parseSession(buildFixture().text);
+	const left = recordSession(session, { name: "left" });
+	const right = recordSession(session, { name: "right" });
+
+	assert.equal(diffTapes(left.tape, right.tape).parent, undefined);
+	assert.doesNotMatch(formatDiff(diffTapes(left.tape, right.tape)), /forked/);
+
+	// A parent pointing at some *other* tape is not a relation to this one.
+	const elsewhere = recordSession(session, { name: "elsewhere", parent: { tapeId: "sha256:nothing-to-do-with-us" } });
+	assert.equal(diffTapes(left.tape, elsewhere.tape).parent, undefined);
+});
+
 // ---------------------------------------------------------------------------
 // stats
 // ---------------------------------------------------------------------------

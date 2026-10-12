@@ -126,3 +126,24 @@ test("normalising the live prefix drops exactly the provenance fields", () => {
 		}
 	}
 });
+
+test("a live call reconnects to its recording despite pi's empty optionals", () => {
+	const { tape } = recordSession(parseSession(sessionText(fixture.recorded)));
+	const engine = new ReplayEngine(tape);
+	const point = engine.toolCallPoints()[0];
+	assert.ok(point);
+
+	// pi fills optional tool parameters when it records them; the model never set
+	// them. Comparing the raw JSON would never match the same call again.
+	assert.deepEqual(point.arguments, { path: "probe-input.txt", offset: null, limit: null });
+	assert.equal(
+		engine.matchRecordedCall("read", { path: "probe-input.txt" }).kind,
+		"hit",
+		"the same call has to match across that spelling difference",
+	);
+	assert.equal(
+		new ReplayEngine(tape).matchRecordedCall("read", { path: "elsewhere.txt" }).kind,
+		"miss",
+		"and a different path still must not",
+	);
+});

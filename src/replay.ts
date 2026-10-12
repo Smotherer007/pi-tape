@@ -24,7 +24,7 @@
 
 import type { ReplayOutcome, SessionEntry, SessionFile, TapeFile } from "./types.ts";
 import { messageOf, parseSession, toolCallsOf } from "./session.ts";
-import { hashPrefix, type HashContext } from "./hash.ts";
+import { hashPrefix, stableStringify, type HashContext } from "./hash.ts";
 import { resolveEntries } from "./tape.ts";
 
 export interface ReplayDiagnostic {
@@ -49,6 +49,17 @@ interface RecordedEvent {
 	hash: string;
 	toolName: string;
 	entry: SessionEntry;
+}
+
+/** One tool call in the recording, linked to the result that answers it. */
+export interface RecordedToolCall {
+	/** 1-based position among the recording's tool calls, so a human can name one. */
+	turn: number;
+	toolCallId: string;
+	toolName: string;
+	arguments: unknown;
+	/** Index into the recorded tool results, when the recording has one for this call. */
+	resultIndex?: number;
 }
 
 export interface ReplayEngineOptions {
@@ -103,6 +114,8 @@ export class ReplayEngine {
 	private readonly toolResults: RecordedEvent[] = [];
 	private readonly consumedAssistants = new Set<number>();
 	private readonly consumedTools = new Set<number>();
+	private readonly calls: RecordedToolCall[] = [];
+	private readonly overrides = new Map<string, unknown>();
 
 	constructor(tape: TapeFile, options: ReplayEngineOptions = {}) {
 		this.tape = tape;
@@ -142,6 +155,97 @@ export class ReplayEngine {
 			}
 			prefix.push(entry);
 		}
+
+		// A second pass links each call to the result that answers it. A fork needs this
+		// twice over: to name where to intervene, and to reconnect a live branch that
+		// asks for something the recording already did.
+		const resultIndexById = new Map<string, number>();
+		this.toolResults.forEach((event, index) => {
+			const id = toolCallIdOf(event.entry);
+			if (id !== undefined) resultIndexById.set(id, index);
+		});
+		for (const entry of this.entries) {
+			for (const call of toolCallsOf(entry)) {
+				const resultIndex = resultIndexById.get(call.id);
+				this.calls.push({
+					turn: this.calls.length + 1,
+					toolCallId: call.id,
+					toolName: call.name,
+					arguments: call.arguments,
+					...(resultIndex === undefined ? {} : { resultIndex }),
+				});
+			}
+		}
+	}
+
+	/**
+	 * The recording's tool calls, in order, so a human or a flag can name one.
+	 *
+	 * `turn` is what `--at 2` means; `toolCallId` is what `--at call_abc` means. Both
+	 * exist because one is readable and the other is exact.
+	 */
+	toolCallPoints(): Array<{
+		turn: number;
+		toolCallId: string;
+		toolName: string;
+		arguments: unknown;
+		hasResult: boolean;
+	}> {
+		return this.calls.map((call) => ({
+			turn: call.turn,
+			toolCallId: call.toolCallId,
+			toolName: call.toolName,
+			arguments: call.arguments,
+			hasResult: call.resultIndex !== undefined,
+		}));
+	}
+
+	/**
+	 * Replace what a recorded tool call returned.
+	 *
+	 * This is the intervention a fork exists for — "what if the tool had said something
+	 * else here". The replacement feeds the *next* request, so the prefix stops
+	 * matching and a real model is asked, which is the whole point rather than a
+	 * side effect.
+	 */
+	setToolResultOverride(toolCallId: string, content: unknown): void {
+		this.overrides.set(toolCallId, content);
+	}
+
+	/** The replacement armed for this tool call, if any. */
+	toolResultOverride(toolCallId: string): unknown | undefined {
+		return this.overrides.get(toolCallId);
+	}
+
+	/** Every intervention this run was armed with, for the report. */
+	toolResultOverrides(): Array<{ toolCallId: string; content: unknown }> {
+		return [...this.overrides].map(([toolCallId, content]) => ({ toolCallId, content }));
+	}
+
+	/**
+	 * Serve a live tool call from the recording when it is the call the recording
+	 * made: same tool, same arguments.
+	 *
+	 * Without this, a fork dies at the first live tool call: the live branch's call ids
+	 * are new, so `nextToolResultById` cannot know the call is the same one the
+	 * recording already answered. Matching on the call itself is what lets a run
+	 * continue past its divergence instead of stopping one thought later.
+	 */
+	matchRecordedCall(toolName: string, args: unknown): ReplayOutcome {
+		const wanted = comparableArguments(args ?? {});
+		for (const call of this.calls) {
+			if (call.toolName !== toolName) continue;
+			if (call.resultIndex === undefined) continue;
+			if (this.consumedTools.has(call.resultIndex)) continue;
+			if (comparableArguments(call.arguments ?? {}) !== wanted) continue;
+			const event = this.toolResults[call.resultIndex] as RecordedEvent;
+			this.markTool(call.resultIndex);
+			return { kind: "hit", via: "reconnect", entry: event.entry };
+		}
+		return {
+			kind: "miss",
+			reason: `the recording has no unconsumed ${toolName} call with these arguments`,
+		};
 	}
 
 	/**
@@ -392,6 +496,33 @@ export function contextOf(entries: SessionEntry[]): HashContext {	const context:
 		}
 	}
 	return context;
+}
+
+/**
+ * Tool arguments reduced to what the caller actually meant.
+ *
+ * pi fills optional parameters with `null` before the call reaches the recording —
+ * `{path: "probe-input.txt", offset: null, limit: null}` — while a live model sends
+ * only the fields it set: `{path: "probe-input.txt"}`. Comparing the raw JSON would
+ * never match the same call, so empty fields are dropped first. That is a deliberate
+ * guess: an argument whose value is genuinely `null` is indistinguishable from one
+ * that was never given, and for a tool call the second reading is by far the likelier.
+ */
+function comparableArguments(value: unknown): string {
+	return stableStringify(dropEmpty(value));
+}
+
+function dropEmpty(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(dropEmpty);
+	if (value !== null && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+			if (item === null || item === undefined) continue;
+			out[key] = dropEmpty(item);
+		}
+		return out;
+	}
+	return value;
 }
 
 /** Build a replay engine directly from a loaded tape. */

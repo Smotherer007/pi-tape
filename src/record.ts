@@ -10,6 +10,7 @@ import type {
 	TapeEntry,
 	TapeFile,
 	TapeOutcomeStatus,
+	TapeParent,
 	TapeProfile,
 	TapeSource,
 	SessionEntry,
@@ -35,6 +36,14 @@ export interface RecordOptions {
 	 * tape is no longer the same run.
 	 */
 	redact?: boolean;
+	/**
+	 * Record that this run was replayed from another tape, and where it diverged.
+	 *
+	 * Kept on the tape rather than only in the transcript: a fork is only meaningful
+	 * next to the run it came from, and `pi-tape diff` reads it to say which turn the
+	 * two share and which value was changed.
+	 */
+	parent?: TapeParent;
 }
 
 const MINIMAL_DROP_TYPES = new Set(["usage", "label", "session_info"]);
@@ -162,6 +171,7 @@ export function recordSession(session: SessionFile, options: RecordOptions = {})
 		source,
 		stats: resolvedStats,
 		outcome,
+		...(options.parent ? { parent: options.parent } : {}),
 		dict,
 		entries: dictedEntries,
 	};

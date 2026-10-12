@@ -102,6 +102,24 @@ export interface TapeOutcome {
 	declared?: boolean;
 }
 
+/** How a run ended up being recorded, and the values that made it diverge. */
+export interface TapeParent {
+	/** The tape this run was derived from. */
+	tapeId: string;
+	/**
+	 * The tool result that was replaced to start the fork, when one was.
+	 *
+	 * `replacement` is kept whole rather than as a preview: it is the difference
+	 * between the two runs, so it is the one thing a `diff` cannot recover from the
+	 * transcript if a capture dropped it.
+	 */
+	forkPoint?: { toolCallId: string; toolName: string; turn: number; replacement: string };
+	/** Requests this run had to ask a provider for, because the recording lacked them. */
+	liveRequests?: number;
+	/** Live tool calls that repeated a recorded call and were served from the tape. */
+	reconnected?: number;
+}
+
 export interface TapeFile {
 	magic: "pi-tape";
 	version: 1;
@@ -118,6 +136,8 @@ export interface TapeFile {
 	stats: TapeStats;
 	/** How the run ended. Absent in recordings made before it was derived. */
 	outcome?: TapeOutcome;
+	/** Set when this run was replayed from another recording. Absent otherwise. */
+	parent?: TapeParent;
 	/** Deduplication pool for large repeated strings; entries reference it by index. */
 	dict: string[];
 	entries: TapeEntry[];
@@ -146,5 +166,5 @@ export function isDictRef(value: unknown): value is DictRef {
 
 /** Result of a single replay lookup. */
 export type ReplayOutcome =
-	| { kind: "hit"; via: "hash" | "cursor"; entry: SessionEntry }
+	| { kind: "hit"; via: "hash" | "cursor" | "reconnect"; entry: SessionEntry }
 	| { kind: "miss"; reason: string };

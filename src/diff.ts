@@ -6,7 +6,7 @@
  * differs and how the tool sequences differ afterwards.
  */
 
-import type { TapeFile, SessionEntry } from "./types.ts";
+import type { TapeFile, TapeParent, SessionEntry } from "./types.ts";
 import { resolveEntries } from "./tape.ts";
 import { contentBlocks, messageOf, toolCallsOf } from "./session.ts";
 import { stableStringify } from "./hash.ts";
@@ -43,6 +43,15 @@ export interface DiffReport {
 	toolSequenceRight: string[];
 	costLeft: number;
 	costRight: number;
+	/**
+	 * Set when the right-hand run was replayed from the left-hand one.
+	 *
+	 * A fork is not a second opinion about the same run — it is that run with one
+	 * value changed — so the divergence is expected and the interesting part is which
+	 * value it was. Without this the report would present a deliberate experiment as a
+	 * regression.
+	 */
+	parent?: TapeParent;
 }
 
 function conversationEntries(tape: TapeFile): SessionEntry[] {
@@ -96,6 +105,8 @@ export function diffTapes(left: TapeFile, right: TapeFile): DiffReport {
 		toolSequenceRight: toolSequence(rightTurns),
 		costLeft: left.stats.costUsd,
 		costRight: right.stats.costUsd,
+		// Only when the right-hand run actually claims the left one as its origin.
+		...(right.parent && right.parent.tapeId === left.id ? { parent: right.parent } : {}),
 	};
 }
 
@@ -121,6 +132,22 @@ export function formatDiff(report: DiffReport): string {
 	add(`left  ${report.leftId.slice(0, 19)}  ${report.leftTurns} turns  $${report.costLeft.toFixed(4)}`);
 	add(`right ${report.rightId.slice(0, 19)}  ${report.rightTurns} turns  $${report.costRight.toFixed(4)}`);
 	add();
+
+	if (report.parent) {
+		add("right was forked from left, so the divergence below is the experiment, not a regression");
+		const point = report.parent.forkPoint;
+		if (point) {
+			add(`  fork point  ${point.toolName} turn ${point.turn} (${point.toolCallId})`);
+			add(`  replaced    ${JSON.stringify(point.replacement)}`);
+		} else {
+			add("  fork point  none — the run diverged on its own prompt");
+		}
+		add(
+			`  live        ${report.parent.liveRequests ?? 0} request(s) asked of a provider · ` +
+				`${report.parent.reconnected ?? 0} live call(s) answered from the recording`,
+		);
+		add();
+	}
 
 	const identical = !report.firstDivergence;
 	if (identical) {
