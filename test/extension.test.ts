@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -661,6 +661,8 @@ test("a live branch that repeats a recorded call gets the recorded result", asyn
 		const reconnected = await tool.execute("call_from_the_live_branch", { path: "a.txt" });
 		assert.equal((reconnected.content as Array<Record<string, unknown>>)[0]?.text, "alpha");
 		assert.notEqual(reconnected.isError, true);
+		assert.equal((reconnected.details as Record<string, unknown>).tape, "reconnected", "a borrowed answer says so");
+		assert.equal((reconnected.details as Record<string, unknown>).from, "call_a0003");
 
 		// A genuinely different request still stops, and says how to allow it.
 		const other = await tool.execute("call_something_new", { path: "other.txt" });
@@ -695,17 +697,102 @@ test("a plain replay never reconnects, because nothing has diverged", async () =
 	}
 });
 
-test("--live-tools leaves a tool alone so pi runs the real one", async () => {
+test("--live-tools serves the recorded prefix and runs only the branch's own calls for real", async () => {
 	const { captured, dir } = prepare();
 	try {
+		writeFileSync(join(dir, "a.txt"), "the file as it is on disk now\n");
 		const session = parseSession(buildFixture().text);
 		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
 		await handler("record live", fakeCtx(dir, session.entries));
 		fakeRegistry = fakeLiveModel("live");
 		await handler("fork live.tape --model live/model-x --live-tools read,write", fakeCtx(dir, session.entries));
 
-		assert.equal(captured.tools.has("read"), false, "an un-overridden tool is the real one");
-		assert.match(capturedNotices.join("\n"), /live tools {4}read, write run for real/);
+		assert.match(capturedNotices.join("\n"), /live tools {4}read, write run for real once the fork leaves the recording/);
+		const tool = captured.tools.get("read") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+		assert.ok(tool, "a live tool is still overridden, so its recorded calls can be served");
+
+		// The recorded call: served from the tape, the real tool does not run again.
+		const recorded = await tool.execute("call_a0003", { path: "a.txt" });
+		assert.equal((recorded.content as Array<Record<string, unknown>>)[0]?.text, "alpha");
+
+		// The branch's own call: the real implementation, in the session's directory.
+		const live = await tool.execute("call_from_the_live_branch", { path: "a.txt" });
+		assert.match(String((live.content as Array<Record<string, unknown>>)[0]?.text), /as it is on disk now/);
+
+		capturedNotices = [];
+		await handler("status", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /1 live tool call\(s\) run for real/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a fork covers declared tools too, so an unrecorded built-in cannot run unasked", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record declared", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork declared.tape --model live/model-x", fakeCtx(dir, session.entries));
+
+		// `write` is declared by the recording but never called in it.
+		const write = captured.tools.get("write") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+		assert.ok(write, "a declared tool is overridden in a fork");
+		const result = await write.execute("call_from_the_live_branch", { path: "b.txt", content: "x" });
+		assert.equal(result.isError, true);
+		assert.equal(existsSync(join(dir, "b.txt")), false, "nothing was written");
+		assert.match(String((result.content as Array<Record<string, unknown>>)[0]?.text), /--live-tools write/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("once a live tool has changed things, nothing reconnects to the recording", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record mutated", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork mutated.tape --model live/model-x --live-tools write", fakeCtx(dir, session.entries));
+
+		const write = captured.tools.get("write") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+		const read = captured.tools.get("read") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+
+		const written = await write.execute("call_live_write", { path: "a.txt", content: "changed by the branch" });
+		assert.notEqual(written.isError, true);
+		assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "changed by the branch");
+
+		// The recording says a.txt is "alpha"; this branch just made it something else.
+		const reread = await read.execute("call_live_read", { path: "a.txt" });
+		assert.equal(reread.isError, true, "a stale recorded answer must not be served");
+		assert.match(String((reread.content as Array<Record<string, unknown>>)[0]?.text), /changed things in this branch/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a live tool that is not a pi built-in is left alone, and the notice says what that costs", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record external", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork external.tape --model live/model-x --live-tools mcp_search", fakeCtx(dir, session.entries));
+
+		assert.equal(captured.tools.has("mcp_search"), false);
+		assert.match(capturedNotices.join("\n"), /not built-in mcp_search/);
+		assert.match(capturedNotices.join("\n"), /RECORDED calls run again/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

@@ -34,5 +34,7 @@ plain honesty both ask for it.
 
 ## Everything else
 
-Node built-ins only, plus `typebox` for the tool schemas the extension declares.
-TypeScript runs directly, with no build step, on Node 22.18+.
+Node built-ins only, plus `typebox` for the tool schemas the extension declares and
+pi's own tool implementations for a fork's live tools — both supplied by pi at
+runtime. TypeScript runs directly from a checkout on Node 22.18+; the published package
+ships a compiled `dist/`.

@@ -435,10 +435,38 @@ again. Matching is on the call itself (tool and normalized arguments, so pi's em
 optionals do not break it), and such a call is served from the recording. That is what
 lets a fork run past its divergence instead of stopping one thought later.
 
-A call the recording does not contain still stops the run, with an explanation.
-`--live-tools read,grep` is the escape hatch: those tools are left un-overridden, so
-pi's real implementation runs them. It has to be decided when the fork is armed,
-because `registerTool` wins over the built-in and cannot be undone in place.
+Reconnecting is only sound while the recorded answer still describes the branch, so it
+is deliberately narrow:
+
+- **Only read-only tools** (`read`, `grep`, `find`, `ls`) reconnect. `bash npm test`
+  with the same arguments is not the same call when the code under test differs, and
+  its recorded output would be a plausible answer to a question nobody asked. An
+  unknown tool — an extension's, an MCP server's — is treated as one that can change
+  things.
+- **Only up to the recording's next change.** The recorded run kept going after the
+  fork point. A `read` of `a.txt` recorded after a `write` to it describes a file this
+  branch never produced, so the candidates end at the first recorded call that is not
+  read-only and has not been served.
+- **Never after a live change.** Once a live tool that can change things has run, the
+  world is the branch's own and nothing reconnects any more.
+- **An intervention holds.** Repeating the call that was intervened on returns the
+  replacement, not the recording.
+
+A reconnected result carries `details.tape: "reconnected"` and the recorded call id in
+`details.from`, so a tape recorded from the fork shows which answers it borrowed.
+
+A call none of that covers stops the run, with an explanation. `--live-tools read,grep`
+runs those tools for real — but only for the branch's own calls: a live tool is still
+overridden, its recorded calls are still served from the tape, and only a call the
+recording does not contain reaches pi's real implementation. Without that, every
+recorded `bash` before the fork point would run a second time. This works for pi's
+built-in tools (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`), whose
+implementations pi exports. Any other tool named in `--live-tools` is left
+un-overridden, because pi-tape cannot reach its implementation, and the arm notice
+warns that its *recorded* calls run again as well.
+
+In a fork, every tool the recording declared is overridden, not only the ones it
+used, so a live branch cannot reach an unrecorded built-in that was never allowed.
 
 ### Two guards on the spend
 
@@ -485,10 +513,10 @@ pi-tape's synthetic provider, so they read `tape-replay` where the recording say
 second request; `test/fixtures/real-session.json` is a capture from a real pi run
 that fails if they are ever hashed again.
 
-The limit is structural and worth knowing before you rely on it: pi cannot unregister
-a tool, so when the live branch calls a tool the recording does not cover, the run
-stops there with an explanation instead of running the real tool. A fork is "replay,
-then one live reasoning step". Executing a procedure is `pi-tape run`.
+The limit is worth knowing before you rely on it: without `--live-tools`, a live branch
+that calls a tool the recording cannot answer stops there with an explanation. With it,
+the real tool runs in the session's directory — which is the world as it is *now*, not
+as it was at the fork point. Executing a procedure is `pi-tape run`.
 
 ## The store
 

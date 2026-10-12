@@ -479,19 +479,25 @@ A debugger that lies is worse than none, so:
   not measured on real sessions. The claims about a cheaper second run and knowledge
   that "multiplies" rest on that layer, so read them as a design argument with tests
   rather than a demonstrated saving. The replay half of the project is the solid one.
-- **A fork continues only where the calls repeat.** A live branch that asks for the
-  same tool with the same arguments gets the recorded result, so a run continues past
-  its divergence. A call the recording does not contain stops it — pi cannot
-  unregister a tool, so naming it in `--live-tools` is the only way to run the real
-  implementation, and that has to be decided when the fork is armed. Executing a
-  procedure is `pi-tape run`.
+- **A fork reconnects narrowly.** A live branch that repeats a recorded call gets the
+  recorded result only for read-only tools, only up to the recording's next change,
+  and never after a live tool has changed something — otherwise it would be served an
+  answer about a world it never produced. Anything else stops the run unless the tool
+  is named in `--live-tools`.
+- **Live tools run in today's directory.** `--live-tools` runs pi's real
+  implementation for the branch's own calls (recorded calls are still served from the
+  tape). The directory it runs in is the world as it is now, not as it was at the fork
+  point, so a live branch of an old recording is not a faithful counterfactual. Only
+  pi's built-in tools can be run this way; any other tool in `--live-tools` is left
+  un-overridden, and its recorded calls run again too. Executing a procedure is
+  `pi-tape run`.
 - **Not yet implemented:** forking from the UI, image payload replay, and rule packs
   loaded from the store so a repository can describe its own tools.
 
 ## Development
 
 ```bash
-npm test                    # the full suite (185 tests at this revision)
+npm test                    # the full suite (191 tests at this revision)
 npm run typecheck           # tsc --noEmit, clean
 npm run build               # tsc -p tsconfig.build.json -> dist/ (needed only to publish)
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library

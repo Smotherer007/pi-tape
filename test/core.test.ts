@@ -424,6 +424,69 @@ test("a tool the recording never used can never reconnect", () => {
 	assert.equal(engine.matchRecordedCall("write", { path: "a.txt" }).kind, "miss");
 });
 
+/**
+ * read a.txt → "v1", then bash rewrites it, then read a.txt → "v2".
+ * The second read describes a world the recording changed after the first one.
+ */
+function changingWorldTape() {
+	const entries = [
+		systemEntry("s1", null),
+		userEntry("u1", "s1", "update a.txt"),
+		assistantToolCall("a1", "u1", "read", { path: "a.txt" }),
+		toolResultEntry("t1", "a1", "read", "v1"),
+		assistantToolCall("a2", "t1", "bash", { command: "echo v2 > a.txt" }),
+		toolResultEntry("t2", "a2", "bash", ""),
+		assistantToolCall("a3", "t2", "read", { path: "a.txt" }),
+		toolResultEntry("t3", "a3", "read", "v2"),
+		assistantText("a4", "t3", "done"),
+	];
+	return recordSession(parseSession(sessionText(entries))).tape;
+}
+
+const textOfEntry = (entry: unknown) =>
+	String(
+		(messageOf(entry as never)?.content as Array<{ text?: string }> | undefined)?.[0]?.text,
+	);
+
+test("a tool that can change things never reconnects, even with identical arguments", () => {
+	const engine = new ReplayEngine(changingWorldTape());
+	const outcome = engine.matchRecordedCall("bash", { command: "echo v2 > a.txt" });
+	assert.equal(outcome.kind, "miss");
+	if (outcome.kind === "miss") assert.match(outcome.reason, /bash can change what it looks at/);
+});
+
+test("reconnect stops at the recording's next change", () => {
+	const engine = new ReplayEngine(changingWorldTape());
+
+	const first = engine.matchRecordedCall("read", { path: "a.txt" });
+	assert.equal(first.kind, "hit");
+	if (first.kind === "hit") assert.equal(textOfEntry(first.entry), "v1");
+
+	// The only other recorded read of a.txt comes after bash rewrote it: that answer
+	// describes the recording's world, not this branch's.
+	const second = engine.matchRecordedCall("read", { path: "a.txt" });
+	assert.equal(second.kind, "miss");
+	if (second.kind === "miss") assert.match(second.reason, /before bash at turn 2 changed things/);
+
+	// Once the change itself has been served, the later read is fair game again.
+	assert.equal(engine.nextToolResultById("call_a2").kind, "hit");
+	const third = engine.matchRecordedCall("read", { path: "a.txt" });
+	assert.equal(third.kind, "hit");
+	if (third.kind === "hit") assert.equal(textOfEntry(third.entry), "v2");
+});
+
+test("repeating an intervened call returns the intervention, not the recording", () => {
+	const engine = new ReplayEngine(changingWorldTape());
+	engine.setToolResultOverride("call_a1", [{ type: "text", text: "REPLACED" }]);
+
+	const outcome = engine.matchRecordedCall("read", { path: "a.txt" });
+	assert.equal(outcome.kind, "hit");
+	if (outcome.kind === "hit") {
+		assert.equal(textOfEntry(outcome.entry), "REPLACED", "asking twice must not undo the counterfactual");
+		assert.equal((messageOf(outcome.entry)?.details as Record<string, unknown>).tape, "override");
+	}
+});
+
 test("a forked recording carries where it came from, and diff says so", () => {
 	const session = parseSession(buildFixture().text);
 	const origin = recordSession(session, { name: "origin" });

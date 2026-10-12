@@ -224,27 +224,66 @@ export class ReplayEngine {
 
 	/**
 	 * Serve a live tool call from the recording when it is the call the recording
-	 * made: same tool, same arguments.
+	 * made: same tool, same arguments — and only when the recorded answer is still
+	 * evidence of what the call would return here.
 	 *
 	 * Without this, a fork dies at the first live tool call: the live branch's call ids
 	 * are new, so `nextToolResultById` cannot know the call is the same one the
 	 * recording already answered. Matching on the call itself is what lets a run
 	 * continue past its divergence instead of stopping one thought later.
+	 *
+	 * Two rules keep it from lying:
+	 *
+	 * - Only read-only tools reconnect (`READ_ONLY_TOOLS`). `bash npm test` with the same
+	 *   arguments is not the same call when the world differs; serving its recorded
+	 *   output would be a plausible answer to a question nobody asked.
+	 * - Only a recorded call that happened *before the next recorded change* is a
+	 *   candidate. The recorded run kept going after the fork point and changed things —
+	 *   a `read` of `a.txt` recorded after a `write` to it describes a file this branch
+	 *   never produced. The horizon is the first recorded call that is not read-only and
+	 *   has not been served yet.
+	 *
+	 * A call that repeats an intervened one gets the replacement, not the recording:
+	 * the counterfactual is that the tool said something else, and asking twice must
+	 * not undo it.
 	 */
 	matchRecordedCall(toolName: string, args: unknown): ReplayOutcome {
+		if (!isReadOnlyTool(toolName)) {
+			return {
+				kind: "miss",
+				reason: `${toolName} can change what it looks at, so a recorded ${toolName} result is not evidence of what it would return in this branch`,
+			};
+		}
+
 		const wanted = comparableArguments(args ?? {});
+		const horizon = this.calls.find(
+			(call) =>
+				!isReadOnlyTool(call.toolName) &&
+				(call.resultIndex === undefined || !this.consumedTools.has(call.resultIndex)),
+		);
+
 		for (const call of this.calls) {
+			if (horizon && call.turn >= horizon.turn) break;
 			if (call.toolName !== toolName) continue;
+			if (comparableArguments(call.arguments ?? {}) !== wanted) continue;
+
+			const replacement = this.overrides.get(call.toolCallId);
+			if (replacement !== undefined) {
+				return { kind: "hit", via: "reconnect", entry: overrideEntry(call, replacement) };
+			}
+
 			if (call.resultIndex === undefined) continue;
 			if (this.consumedTools.has(call.resultIndex)) continue;
-			if (comparableArguments(call.arguments ?? {}) !== wanted) continue;
 			const event = this.toolResults[call.resultIndex] as RecordedEvent;
 			this.markTool(call.resultIndex);
 			return { kind: "hit", via: "reconnect", entry: event.entry };
 		}
+
 		return {
 			kind: "miss",
-			reason: `the recording has no unconsumed ${toolName} call with these arguments`,
+			reason: horizon
+				? `the recording has no unconsumed ${toolName} call with these arguments before ${horizon.toolName} at turn ${horizon.turn} changed things`
+				: `the recording has no unconsumed ${toolName} call with these arguments`,
 		};
 	}
 
@@ -496,6 +535,35 @@ export function contextOf(entries: SessionEntry[]): HashContext {	const context:
 		}
 	}
 	return context;
+}
+
+/**
+ * Tools that only look. Reconnecting a live call to its recording is sound for these
+ * and nothing else: a tool that can change the world may answer differently the
+ * second time, and an unknown tool (an MCP server, an extension) is assumed to be
+ * one that can.
+ */
+export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(["read", "grep", "find", "ls"]);
+
+export function isReadOnlyTool(name: string): boolean {
+	return READ_ONLY_TOOLS.has(name);
+}
+
+/** A recorded tool call answered with its intervention, shaped like a recorded result. */
+function overrideEntry(call: RecordedToolCall, content: unknown): SessionEntry {
+	return {
+		type: "message",
+		id: `override-${call.toolCallId}`,
+		parentId: null,
+		timestamp: "",
+		message: {
+			role: "toolResult",
+			toolCallId: call.toolCallId,
+			toolName: call.toolName,
+			content,
+			details: { tape: "override" },
+		},
+	} as SessionEntry;
 }
 
 /**

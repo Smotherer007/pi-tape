@@ -51,6 +51,15 @@ import { dirname, join, resolve } from "node:path";
 import type { AssistantMessage, AssistantMessageEventStream, ToolCall } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { recordSession } from "../src/record.ts";
@@ -69,7 +78,7 @@ import {
 	type RegressionReport,
 	type RegressionSample,
 } from "../src/regress.ts";
-import { entriesFromMessages } from "../src/replay.ts";
+import { entriesFromMessages, isReadOnlyTool } from "../src/replay.ts";
 import {
 	globalStoreDir,
 	indexIsStale,
@@ -111,10 +120,11 @@ interface Shadow {
  * answered with the next recorded event. That is what makes the prefix key worth
  * having: only the branch after the first divergence costs tokens.
  *
- * The limit is real and worth stating up front: pi cannot unregister a tool, so a
- * live answer that calls a tool the recording does not cover stops the fork rather
- * than running the real tool. A fork continues as far as the recording plus one
- * live reasoning step; running an actual procedure is `pi-tape run`.
+ * Past the divergence a tool call is answered in one of three ways: a read-only call
+ * that repeats a recorded one before the recording's next change is served from the
+ * tape; a tool named in `--live-tools` runs pi's real implementation; anything else
+ * stops the fork with an explanation. Recorded calls are always served from the tape,
+ * live tools included, so the replayed prefix never runs its side effects again.
  *
  * `maxLiveTokens` is the brake, not a decoration. A miss that is a hash mismatch
  * rather than a real divergence would otherwise go live on every single request,
@@ -128,8 +138,25 @@ interface Fork {
 	forks: number;
 	/** Live branches served from the recording because they repeated a recorded call. */
 	reconnected: number;
-	/** Tools left un-overridden, so pi's real implementation runs them. */
+	/**
+	 * Tools that run for real once the fork has left the recording. A recorded call is
+	 * still served from the tape, so the prefix never repeats its side effects.
+	 */
 	liveTools: string[];
+	/**
+	 * Live tools pi-tape cannot reach the implementation of (not pi built-ins). They are
+	 * left un-overridden, which means their recorded calls run again too — said so at arm time.
+	 */
+	unreachableLiveTools: string[];
+	/** Where live tools run. */
+	cwd: string;
+	/** Live tool calls actually executed. */
+	liveRuns: number;
+	/**
+	 * Set once a live tool that can change things has run. From then on the world is
+	 * this branch's, not the recording's, so nothing reconnects to the recording any more.
+	 */
+	liveMutated: boolean;
 	/** The armed intervention, if the fork was pointed at a tool result. */
 	intervention?: { toolCallId: string; turn: number; toolName: string; result: string };
 	/** Set when the very first request missed, which is usually a hash mismatch. */
@@ -1208,6 +1235,77 @@ function toolResultPayload(entry: SessionEntry) {
 	};
 }
 
+/**
+ * A reconnected result, marked as one.
+ *
+ * The recorded details are kept, but `tape: "reconnected"` and the recorded call id
+ * say where the answer came from, so a tape recorded from the fork shows which results
+ * the branch produced and which it borrowed from the run it forked.
+ */
+function reconnectedPayload(entry: SessionEntry) {
+	const payload = toolResultPayload(entry);
+	const message = (entry.message ?? {}) as Record<string, unknown>;
+	const recorded = message.details;
+	const base = recorded !== null && typeof recorded === "object" && !Array.isArray(recorded) ? recorded : {};
+	return {
+		...payload,
+		details: {
+			...(base as Record<string, unknown>),
+			tape: (base as Record<string, unknown>).tape === "override" ? "override" : "reconnected",
+			from: message.toolCallId,
+		} as never,
+	};
+}
+
+/** The read-only tools, for the arm notice. */
+const READ_ONLY_NAMES = ["read", "grep", "find", "ls"].filter(isReadOnlyTool);
+
+type BuiltinFactory = (cwd: string) => {
+	execute(toolCallId: string, params: never, signal: unknown, onUpdate: unknown, ctx: unknown): Promise<unknown>;
+};
+
+/**
+ * pi's own tool implementations, which is what lets a fork run a real tool behind an
+ * override instead of leaving the tool un-overridden and replaying its side effects.
+ */
+const BUILTIN_TOOLS: Record<string, BuiltinFactory> = {
+	read: createReadToolDefinition as unknown as BuiltinFactory,
+	bash: createBashToolDefinition as unknown as BuiltinFactory,
+	edit: createEditToolDefinition as unknown as BuiltinFactory,
+	write: createWriteToolDefinition as unknown as BuiltinFactory,
+	grep: createGrepToolDefinition as unknown as BuiltinFactory,
+	find: createFindToolDefinition as unknown as BuiltinFactory,
+	ls: createLsToolDefinition as unknown as BuiltinFactory,
+};
+
+/**
+ * The declaration of a pi built-in, for a live tool the recording never declared — so
+ * the model sees the real schema rather than an empty one.
+ */
+function builtinDeclaration(name: string, cwd: string): Record<string, unknown> | undefined {
+	const factory = BUILTIN_TOOLS[name];
+	if (!factory) return undefined;
+	const definition = factory(cwd) as unknown as { description?: unknown; parameters?: unknown };
+	return { name, description: definition.description, parameters: definition.parameters };
+}
+
+/** Run a live tool for real, in the session's directory, and count it. */
+async function runLiveTool(
+	fork: Fork,
+	name: string,
+	toolCallId: string,
+	params: unknown,
+	signal: unknown,
+	onUpdate: unknown,
+	toolCtx: unknown,
+) {
+	const factory = BUILTIN_TOOLS[name] as BuiltinFactory;
+	fork.liveRuns += 1;
+	// Mark before running: a tool that fails half-way may already have changed things.
+	if (!isReadOnlyTool(name)) fork.liveMutated = true;
+	return (await factory(fork.cwd).execute(toolCallId, (params ?? {}) as never, signal, onUpdate, toolCtx)) as never;
+}
+
 /** Modes a replay can be armed in. A plain replay is neither. */
 interface PlayModes {
 	/** Ask this model the same requests in the background, while serving the recording. */
@@ -1273,8 +1371,15 @@ function playCommand(
 			liveTokens: 0,
 			forks: 0,
 			reconnected: 0,
-			liveTools: [...new Set((liveTools ?? []).map((item) => item.trim()).filter(Boolean))],
+			liveTools: [],
+			unreachableLiveTools: [],
+			cwd: ctx.cwd,
+			liveRuns: 0,
+			liveMutated: false,
 		};
+		for (const name of new Set((liveTools ?? []).map((item) => item.trim()).filter(Boolean))) {
+			(BUILTIN_TOOLS[name] ? fork.liveTools : fork.unreachableLiveTools).push(name);
+		}
 		if (at !== undefined && result !== undefined) {
 			const point = resolveIntervention(engine, at);
 			if (!point) {
@@ -1350,12 +1455,27 @@ function playCommand(
 		},
 	});
 
-	// Override every tool the recording used with a cache-backed stand-in — except the
-	// ones the fork was told to run for real. A tool cannot be un-overridden later
-	// (`registerTool` wins over the built-in), so `--live-tools` has to decide here.
-	for (const name of engine.toolNames()) {
-		if (active.fork?.liveTools.includes(name)) continue;
-		const declaration = engine.toolDeclaration(name);
+	// Override every tool the recording used with a cache-backed stand-in. A live tool
+	// is overridden too: its recorded calls are served from the tape like any other, and
+	// only a call the recording does not contain reaches pi's real implementation. That
+	// is what keeps the replayed prefix from running its side effects a second time.
+	//
+	// The exception is a live tool pi-tape cannot build itself (an extension's or an MCP
+	// server's): `registerTool` would hide the real one for good, so it is left alone,
+	// and the arm notice says that its recorded calls run again.
+	//
+	// A fork also covers every tool the recording *declared*, and every live tool, not
+	// only the ones it used: a live branch can reach for a tool the original run never
+	// called, and an un-overridden built-in would then run for real without having
+	// been allowed to.
+	const overridden = new Set(engine.toolNames());
+	if (active.fork) {
+		for (const name of engine.declaredToolNames()) overridden.add(name);
+		for (const name of active.fork.liveTools) overridden.add(name);
+	}
+	for (const name of overridden) {
+		if (active.fork?.unreachableLiveTools.includes(name)) continue;
+		const declaration = engine.toolDeclaration(name) ?? builtinDeclaration(name, ctx.cwd);
 		const parameters =
 			declaration && typeof declaration.parameters === "object" && declaration.parameters !== null
 				? Type.Unsafe(declaration.parameters as never)
@@ -1367,7 +1487,7 @@ function playCommand(
 			description:
 				typeof declaration?.description === "string" ? declaration.description : `Recorded stand-in for ${name}`,
 			parameters,
-			async execute(toolCallId: string, params?: unknown) {
+			async execute(toolCallId: string, params?: unknown, signal?: AbortSignal, onUpdate?: unknown, toolCtx?: unknown) {
 				const current = armed;
 				if (!current) {
 					return {
@@ -1386,19 +1506,31 @@ function playCommand(
 				const outcome = current.engine.nextToolResultById(toolCallId);
 				if (outcome.kind === "hit") return toolResultPayload(outcome.entry);
 
-				// A live branch that asks for what the recording already did gets the recorded
-				// answer, so the run continues past its divergence instead of stopping one
-				// thought later. Matching is on the call itself, not on the id.
+				let reason = outcome.reason;
 				if (current.fork) {
-					const reconnected = current.engine.matchRecordedCall(name, params ?? {});
-					if (reconnected.kind === "hit") {
-						current.fork.reconnected += 1;
-						return toolResultPayload(reconnected.entry);
+					// Past the divergence a live tool runs for real. Its recorded calls were
+					// served above, so only this branch's own calls get here.
+					if (current.fork.liveTools.includes(name)) {
+						return runLiveTool(current.fork, name, toolCallId, params, signal, onUpdate, toolCtx);
+					}
+
+					// A live branch that asks for what the recording already did gets the
+					// recorded answer, so the run continues instead of stopping one thought
+					// later — as long as the recording still describes this branch's world.
+					if (current.fork.liveMutated) {
+						reason = "a live tool has changed things in this branch, so the recording no longer describes it";
+					} else {
+						const reconnected = current.engine.matchRecordedCall(name, params ?? {});
+						if (reconnected.kind === "hit") {
+							current.fork.reconnected += 1;
+							return reconnectedPayload(reconnected.entry);
+						}
+						reason = reconnected.reason;
 					}
 				}
 
 				const text = current.fork
-					? `tape: ${outcome.reason}. This fork went live and asked for something the recording does not contain, and pi-tape cannot run the real tool from inside a replay. Keep the real tool with \`--live-tools ${name}\`, record a fresh tape, or run the procedure with \`pi-tape run\`.`
+					? `tape: ${reason}. This fork went live and asked for something the recording cannot answer, and the real ${name} is not enabled. Run it for real with \`--live-tools ${name}\`, record a fresh tape, or run the procedure with \`pi-tape run\`.`
 					: `tape: ${outcome.reason}`;
 				return {
 					content: [{ type: "text", text }],
@@ -1426,9 +1558,21 @@ function playCommand(
 			lines.push(`  intervention  ${toolName} turn ${turn} (${toolCallId}) → ${JSON.stringify(previewText(result))}`);
 		}
 		if (active.fork.liveTools.length) {
-			lines.push(`  live tools    ${active.fork.liveTools.join(", ")} run for real, not from the recording`);
+			lines.push(
+				`  live tools    ${active.fork.liveTools.join(", ")} run for real once the fork leaves the recording`,
+				"                their recorded calls are still served from the tape, so nothing runs twice",
+			);
 		}
-		lines.push("                a live branch that repeats a recorded call gets the recorded result");
+		if (active.fork.unreachableLiveTools.length) {
+			lines.push(
+				`  ⚠ not built-in ${active.fork.unreachableLiveTools.join(", ")}: pi-tape cannot reach the implementation,`,
+				"                so they are left as they are — and their RECORDED calls run again, side effects included",
+			);
+		}
+		lines.push(
+			`                a live branch that repeats a recorded ${[...READ_ONLY_NAMES].join("/")} call gets the recorded result`,
+			"                until the recording's next change; anything else is asked of the real tool or stops",
+		);
 	}
 	lines.push(
 		"",
@@ -1572,6 +1716,7 @@ function statusCommand(ctx: ExtensionCommandContext): void {
 				? `  fork       ${armed.fork.forks} request(s) the recording lacked → ` +
 					`${armed.fork.provider}/${armed.fork.modelId} · ${armed.fork.liveTokens}/${armed.fork.maxLiveTokens} tokens` +
 					(armed.fork.reconnected ? `\n  fork       ${armed.fork.reconnected} live call(s) reconnected to the recording` : "") +
+					(armed.fork.liveRuns ? `\n  fork       ${armed.fork.liveRuns} live tool call(s) run for real` : "") +
 					(armed.fork.intervention
 						? `\n  fork       ${armed.fork.intervention.toolName} turn ${armed.fork.intervention.turn} was replaced with ${JSON.stringify(previewText(armed.fork.intervention.result))}`
 						: "") +
@@ -1650,7 +1795,7 @@ export default function (pi: ExtensionAPI) {
 								"  --max-live-tokens N   token budget (default 50000); the run stops when it is spent\n" +
 								"  --at <turn|toolCallId> --result <text|@file>\n" +
 								"                        answer that tool call differently, then continue with the model\n" +
-								"  --live-tools a,b      run those tools for real instead of serving the recording",
+								"  --live-tools a,b      run pi's real tool for the fork's own calls (recorded ones stay on tape)",
 							"warning",
 						);
 						return;
@@ -1760,7 +1905,7 @@ export default function (pi: ExtensionAPI) {
 							"                           serve the recording, ask the model where it ends",
 							"    --at <turn|id> --result <text|@file>",
 							"                           answer one tool call differently, then continue live",
-							"    --live-tools a,b       run those tools for real instead of replaying them",
+							"    --live-tools a,b       run pi's real tool for the fork's own calls (recorded ones stay on tape)",
 							"    --max-live-tokens N    token budget (default 50000)",
 							"  /tape regress            what the shadow model answered differently",,
 							"  /tape status             replay progress, misses, shadow and fork progress",
