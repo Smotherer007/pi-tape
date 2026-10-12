@@ -79,6 +79,40 @@ test("volatile metadata does not change the prefix hash", () => {
 	assert.equal(hashPrefix(changed), baseline, "timestamps, usage and ids are not part of the request");
 });
 
+test("how long a turn took, and the thinking level it ran at, do not change the hash", () => {
+	// Both differ on every real replay: a replayed tool takes 0 ms, a replayed answer
+	// takes no time, and a replay at another /thinking level stamps every served answer
+	// with it. Hashing them turned every request after the first into a miss in real pi.
+	const entries = [
+		systemEntry("s1", null),
+		userEntry("u1", "s1", "read it"),
+		assistantToolCall("a1", "u1", "read", { path: "a.txt" }),
+		toolResultEntry("t1", "a1", "read", "alpha"),
+	];
+	const baseline = hashPrefix(entries);
+
+	const replayed = structuredClone(entries);
+	const answer = (replayed[2] as Record<string, unknown>).message as Record<string, unknown>;
+	answer.durationMs = 0;
+	answer.thinkingLevel = "high";
+	((replayed[3] as Record<string, unknown>).message as Record<string, unknown>).durationMs = 0;
+
+	const recorded = structuredClone(entries);
+	const original = (recorded[2] as Record<string, unknown>).message as Record<string, unknown>;
+	original.durationMs = 4_210;
+	original.thinkingLevel = "off";
+	((recorded[3] as Record<string, unknown>).message as Record<string, unknown>).durationMs = 1;
+
+	assert.equal(hashPrefix(recorded), hashPrefix(replayed));
+	assert.equal(hashPrefix(recorded), baseline);
+
+	// The guarantee stays narrow: the tool result's content still counts.
+	((replayed[3] as Record<string, unknown>).message as Record<string, unknown>).content = [
+		{ type: "text", text: "something else" },
+	];
+	assert.notEqual(hashPrefix(replayed), baseline);
+});
+
 test("changing message content changes the prefix hash", () => {
 	const fixture = buildFixture();
 	const session = parseSession(fixture.text);

@@ -58,6 +58,16 @@ const VOLATILE_MESSAGE_KEYS = new Set([
 	"api",
 	"model",
 	"provider",
+	// How long an earlier turn or tool took, and which thinking level pi asked for when
+	// it produced an earlier answer. Both describe how a past turn came about, not what
+	// the next request contains, and both differ on every replay: a replayed tool takes
+	// 0 ms where the recorded one took 1, a replayed answer takes no time where the
+	// model took seconds, and a replay at a different `/thinking` level stamps every
+	// served answer with that level. Found by running a fork in a real pi, where each
+	// one turned every request after the first into a miss. The thinking level of the
+	// request itself is still bindable through `HashContext.thinkingLevel`.
+	"durationMs",
+	"thinkingLevel",
 ]);
 
 const VOLATILE_BLOCK_KEYS = new Set([
