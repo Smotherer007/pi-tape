@@ -79,11 +79,18 @@ function fakeCtx(cwd: string, branch: unknown[], sessionFile?: string) {
 			getSessionFile: () => sessionFile,
 			getSessionId: () => "test-session-0001",
 		},
+		modelRegistry: fakeRegistry,
 	};
 }
 
 let capturedNotices: string[] = [];
 let capturedStatuses: Array<[string, string | undefined]> = [];
+
+/**
+ * The model registry a fork or shadow run reaches for. `undefined` by default,
+ * which is the honest state for a plain replay: it never asks a model.
+ */
+let fakeRegistry: unknown;
 
 /**
  * The extension keeps its armed state at module scope, so a test that arms a
@@ -105,6 +112,7 @@ afterEach(async () => {
 function prepare(): { captured: Captured; dir: string } {
 	capturedNotices = [];
 	capturedStatuses = [];
+	fakeRegistry = undefined;
 	const { pi, captured } = fakePi();
 	tape(pi as never);
 	activeHandler = captured.commands.get("tape");
@@ -333,6 +341,191 @@ test("load rejects a file that is not a tape", async () => {
 		await handler("play does-not-exist.tape", fakeCtx(dir, []));
 		assert.match(capturedNotices.join("\n"), /Could not load/);
 		assert.equal(captured.providers.has("tape"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Fork: asking a model a request the recording does not contain
+// ---------------------------------------------------------------------------
+
+/** A registry whose one model answers with a fixed text, reporting real tokens. */
+function fakeLiveModel(answer: string) {
+	return {
+		find: (provider: string, modelId: string) => ({ provider, modelId }),
+		streamSimple: () => {
+			const final = {
+				role: "assistant",
+				content: [{ type: "text", text: answer }],
+				api: "live",
+				provider: "live",
+				model: "model-x",
+				usage: {
+					input: 3,
+					output: 4,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 7,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			};
+			return (async function* () {
+				yield { type: "start", partial: { ...final, content: [], stopReason: "pending" } };
+				yield { type: "done", reason: "stop", message: final };
+			})();
+		},
+	};
+}
+
+function streamOf(captured: Captured) {
+	const provider = captured.providers.get("tape") as Record<string, unknown>;
+	return provider.streamSimple as (
+		model: unknown,
+		context: unknown,
+	) => AsyncIterable<Record<string, unknown>> & { result(): Promise<Record<string, unknown>> };
+}
+
+test("fork mode asks the live model where the recording ends instead of serving the next event", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record forked", fakeCtx(dir, session.entries));
+
+		fakeRegistry = fakeLiveModel("a genuinely live answer");
+		// The `--model=x/y` spelling is accepted too, and must not leak into the file name.
+		await handler("fork forked.tape --model=live/model-x", fakeCtx(dir, session.entries));
+
+		const stream = streamOf(captured)(
+			{ api: "tape-replay", provider: "tape", id: "test-model" },
+			{ messages: [{ role: "user", content: [{ type: "text", text: "a prompt the recording never saw" }] }] },
+		);
+		for await (const _event of stream) void _event;
+
+		const final = await stream.result();
+		const content = final.content as Array<Record<string, unknown>>;
+		assert.equal(
+			content[0]?.text,
+			"a genuinely live answer",
+			"a new context must be asked of the model, not answered with the old recording",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("fork mode still serves the recorded prefix, for free", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record forked", fakeCtx(dir, session.entries));
+
+		fakeRegistry = fakeLiveModel("should not be reached");
+		await handler("fork forked.tape --model live/model-x", fakeCtx(dir, session.entries));
+
+		const stream = streamOf(captured)(
+			{ api: "tape-replay", provider: "tape", id: "test-model" },
+			{ messages: prefixMessagesForFirstAssistant() },
+		);
+		for await (const _event of stream) void _event;
+
+		const final = await stream.result();
+		const content = final.content as Array<Record<string, unknown>>;
+		assert.equal(content[0]?.type, "toolCall", "the recorded turn comes from the tape");
+		assert.equal((final.usage as { cost: { total: number } }).cost.total, 0, "the recorded part costs nothing");
+
+		capturedNotices = [];
+		await handler("status", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /fork {7}0 request\(s\) the recording lacked/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a fork tool call the recording does not cover stops with an explanation", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record forked", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork forked.tape --model live/model-x", fakeCtx(dir, session.entries));
+
+		const tool = captured.tools.get("read") as { execute: (id: string) => Promise<Record<string, unknown>> };
+		const result = await tool.execute("call_from_the_live_branch");
+
+		assert.equal(result.isError, true);
+		assert.match(String((result.content as Array<Record<string, unknown>>)[0]?.text), /fork went live/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("fork without a usable --model prints usage instead of arming", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record forked", fakeCtx(dir, session.entries));
+		capturedNotices = [];
+
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork forked.tape --model notamodel", fakeCtx(dir, session.entries));
+
+		assert.match(capturedNotices.join("\n"), /Usage: \/tape fork/);
+		assert.equal(captured.providers.has("tape"), false, "half a model name must not arm a fork");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a fork budget that is not a number is refused, not guessed", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record forked", fakeCtx(dir, session.entries));
+		capturedNotices = [];
+
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork forked.tape --model live/model-x --max-live-tokens lots", fakeCtx(dir, session.entries));
+
+		assert.match(capturedNotices.join("\n"), /--max-live-tokens expects a number/);
+		assert.equal(captured.providers.has("tape"), false, "an unreadable budget must not arm a fork");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("the fork budget is announced, and a spent budget stops the next request", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record budgeted", fakeCtx(dir, session.entries));
+
+		fakeRegistry = fakeLiveModel("live answer");
+		await handler("fork budgeted.tape --model live/model-x --max-live-tokens 0", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /budget 0 live tokens/, "the arm notice says what may be spent");
+
+		const stream = streamOf(captured)(
+			{ api: "tape-replay", provider: "tape", id: "test-model" },
+			{ messages: [{ role: "user", content: [{ type: "text", text: "a diverging prompt" }] }] },
+		);
+		const events: Array<Record<string, unknown>> = [];
+		for await (const event of stream) events.push(event);
+
+		const last = events.at(-1) as { type: string; error: { errorMessage: string } };
+		assert.equal(last.type, "error", "a spent budget is an error, not a silent live call");
+		assert.match(last.error.errorMessage, /live-token budget \(0 of 0 tokens\)/);
+
+		// The same request also misfires the mismatch warning, because the very first
+		// request is not in the recording. Both facts must be visible, not either.
+		assert.match(capturedNotices.join("\n"), /first request is not in the recording/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

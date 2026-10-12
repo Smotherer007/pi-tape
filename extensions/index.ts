@@ -104,6 +104,32 @@ interface Shadow {
 	pending: number;
 }
 
+/** A fork run.
+ *
+ * Recorded prefix answers are still served from the tape, but a request the
+ * recording does not contain is asked of the named model instead of being
+ * answered with the next recorded event. That is what makes the prefix key worth
+ * having: only the branch after the first divergence costs tokens.
+ *
+ * The limit is real and worth stating up front: pi cannot unregister a tool, so a
+ * live answer that calls a tool the recording does not cover stops the fork rather
+ * than running the real tool. A fork continues as far as the recording plus one
+ * live reasoning step; running an actual procedure is `pi-tape run`.
+ *
+ * `maxLiveTokens` is the brake, not a decoration. A miss that is a hash mismatch
+ * rather than a real divergence would otherwise go live on every single request,
+ * and the bill is the first thing anyone would notice.
+ */
+interface Fork {
+	provider: string;
+	modelId: string;
+	maxLiveTokens: number;
+	liveTokens: number;
+	forks: number;
+	/** Set when the very first request missed, which is usually a hash mismatch. */
+	suspectMismatch?: boolean;
+}
+
 interface Armed {
 	path: string;
 	tape: TapeFile;
@@ -111,6 +137,7 @@ interface Armed {
 	modelId: string;
 	registeredTools: string[];
 	shadow?: Shadow;
+	fork?: Fork;
 }
 
 /** Module state: undefined means capture/live mode. */
@@ -687,6 +714,31 @@ async function notifyObserver(
 	}
 }
 
+/** A stream-level failure the agent can read, in the shape pi expects. */
+function failureMessage(
+	model: { api: string; provider: string; id: string },
+	details: { text: string; errorMessage: string },
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: details.text }],
+		api: model.api as AssistantMessage["api"],
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "error",
+		errorMessage: details.errorMessage,
+		timestamp: Date.now(),
+	};
+}
+
 /**
  * Turn a recorded assistant message into a well-formed event stream.
  *
@@ -705,24 +757,10 @@ function createReplayStream(
 		const outcome = active.engine.nextAssistantFromMessages(context.messages);
 
 		if (outcome.kind === "miss") {
-			const failure: AssistantMessage = {
-				role: "assistant",
-				content: [{ type: "text", text: `tape: ${outcome.reason}` }],
-				api: model.api as AssistantMessage["api"],
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "error",
+			const failure = failureMessage(model, {
+				text: `tape: ${outcome.reason}`,
 				errorMessage: `tape: ${outcome.reason}. The replay left the recording; replay a fork, or record a new tape.`,
-				timestamp: Date.now(),
-			};
+			});
 			stream.push({ type: "error", reason: "error", error: failure });
 			stream.end();
 			return;
@@ -789,6 +827,112 @@ function createReplayStream(
 
 		stream.push({ type: "done", reason: output.stopReason, message: output });
 		stream.end();
+	})();
+
+	return stream;
+}
+
+/**
+ * The parts of a replayed request a live call may inherit.
+ *
+ * pi calls the replay provider with *its* credentials attached —
+ * `apiKey: "not-needed-replay-is-offline"` — and the model registry lets a
+ * caller's `apiKey` win over the resolved one. Forwarding that whole bag to the
+ * real model authenticates with the placeholder and returns a 401 that reads like
+ * a bad key. Only the sampling settings travel; auth, headers and routing belong
+ * to the target provider.
+ */
+function liveCallOptions(options: unknown): Record<string, unknown> {
+	const { apiKey, headers, env, baseUrl, transformHeaders, ...rest } = (options ?? {}) as Record<string, unknown>;
+	void apiKey;
+	void headers;
+	void env;
+	void baseUrl;
+	void transformHeaders;
+	return rest;
+}
+
+/**
+ * A fork's divergent turn: the request is not in the recording, so it is asked of
+ * a real provider while everything that still matches is served from the tape.
+ *
+ * The failure path matters as much as the happy one. If the model is gone, or the
+ * call throws, the run gets an error it can read instead of an invented answer.
+ */
+function createForkStream(
+	active: Armed,
+	registry: LiveRegistry,
+	context: { messages: unknown[] },
+	options: unknown,
+	model: { api: string; provider: string; id: string },
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const fork = active.fork;
+
+	void (async () => {
+		if (!fork) {
+			const failure = failureMessage(model, {
+				text: "tape: fork mode is not armed",
+				errorMessage: "tape: fork mode is not armed",
+			});
+			stream.push({ type: "error", reason: "error", error: failure });
+			stream.end();
+			return;
+		}
+
+		const label = `${fork.provider}/${fork.modelId}`;
+		if (fork.liveTokens >= fork.maxLiveTokens) {
+			stream.push({
+				type: "error",
+				reason: "error",
+				error: failureMessage(model, {
+					text: `tape: the fork's live-token budget is spent (${fork.liveTokens} of ${fork.maxLiveTokens})`,
+					errorMessage:
+						`tape: this fork has spent its live-token budget (${fork.liveTokens} of ${fork.maxLiveTokens} tokens), so the request was not sent. ` +
+						"Raise it with /tape fork <file> --model <p>/<m> --max-live-tokens N, or record a new tape. Nothing was invented; the run stops here.",
+				}),
+			});
+			stream.end();
+			return;
+		}
+
+		const target = registry.find(fork.provider, fork.modelId);
+		if (!target) {
+			stream.push({
+				type: "error",
+				reason: "error",
+				error: failureMessage(model, {
+					text: `tape: ${label} is not in the model registry`,
+					errorMessage: `tape: the fork target ${label} is not in the model registry, so the divergent request cannot be answered. The recording is intact; nothing was invented.`,
+				}),
+			});
+			stream.end();
+			return;
+		}
+
+		try {
+			let last: unknown;
+			for await (const event of registry.streamSimple(target, context, liveCallOptions(options))) {
+				stream.push(event as never);
+				const item = event as { type?: string; message?: unknown; error?: unknown; partial?: unknown };
+				if (item.type === "done") last = item.message;
+				else if (item.type === "error") last = item.error;
+				else if (item.partial !== undefined) last = item.partial;
+			}
+			fork.liveTokens += tokensOfMessage(last);
+			fork.forks++;
+		} catch (error) {
+			stream.push({
+				type: "error",
+				reason: "error",
+				error: failureMessage(model, {
+					text: `tape: the fork call to ${label} failed`,
+					errorMessage: `tape: the fork call to ${label} failed: ${(error as Error).message}`,
+				}),
+			});
+		} finally {
+			stream.end();
+		}
 	})();
 
 	return stream;
@@ -902,11 +1046,77 @@ function resolveTapePath(reference: string, baseDir: string): string {
 	return resolve(baseDir, reference.endsWith(".tape") ? reference : `${reference}.tape`);
 }
 
+/**
+ * Split the arm arguments out of a command line.
+ *
+ * Both `--model p/id` and `--model=p/id` are accepted, likewise
+ * `--max-live-tokens N`, and what is left over is the file reference. A malformed
+ * value yields no target (or a `error`) so the caller prints its own usage line
+ * instead of acting on half a model name or an unreadable budget.
+ */
+function parseArmArguments(rest: string): {
+	file: string;
+	target?: { provider: string; modelId: string };
+	maxLiveTokens?: number;
+	error?: string;
+} {
+	const parts = rest.trim().split(/\s+/).filter(Boolean);
+	const consumed = new Set<number>();
+	let target: { provider: string; modelId: string } | undefined;
+	let maxLiveTokens: number | undefined;
+	let error: string | undefined;
+
+	parts.forEach((part, index) => {
+		const flag = (name: string): string | undefined => {
+			if (part === name) {
+				consumed.add(index).add(index + 1);
+				return parts[index + 1];
+			}
+			if (part.startsWith(`${name}=`)) {
+				consumed.add(index);
+				return part.slice(name.length + 1);
+			}
+			return undefined;
+		};
+
+		const model = flag("--model");
+		if (model !== undefined) {
+			const slash = model.indexOf("/");
+			if (slash > 0 && slash < model.length - 1) {
+				target = { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+			}
+			return;
+		}
+
+		const budget = flag("--max-live-tokens");
+		if (budget !== undefined) {
+			const parsed = Number(budget);
+			if (!Number.isFinite(parsed) || parsed < 0) error = `--max-live-tokens expects a number, got "${budget}"`;
+			else maxLiveTokens = parsed;
+		}
+	});
+
+	return {
+		file: parts.filter((_, index) => !consumed.has(index)).join(" "),
+		...(target ? { target } : {}),
+		...(maxLiveTokens === undefined ? {} : { maxLiveTokens }),
+		...(error === undefined ? {} : { error }),
+	};
+}
+
+/** Modes a replay can be armed in. A plain replay is neither. */
+interface PlayModes {
+	/** Ask this model the same requests in the background, while serving the recording. */
+	shadow?: { provider: string; modelId: string };
+	/** Ask this model a request the recording does not contain, instead of the next recorded event. */
+	fork?: { provider: string; modelId: string; maxLiveTokens?: number };
+}
+
 function playCommand(
 	pi: ExtensionAPI,
 	reference: string,
 	ctx: ExtensionCommandContext,
-	shadowTarget?: { provider: string; modelId: string },
+	modes: PlayModes = {},
 ): void {
 	if (!reference.trim()) {
 		ctx.ui.notify("Usage: /tape play <file.tape>", "warning");
@@ -926,12 +1136,18 @@ function playCommand(
 		return;
 	}
 
-	const engine = new ReplayEngine(tape);
+	// Fork mode switches off the positional fallback, so a request the recording
+	// does not contain is reported as a miss instead of being answered from it.
+	const engine = new ReplayEngine(tape, modes.fork ? { onMiss: "miss" } : {});
 	const recordedModels = tape.stats.models;
 	const modelId = recordedModels[0] ?? "replay";
 	const active: Armed = { path, tape, engine, modelId, registeredTools: [] };
-	if (shadowTarget) {
-		active.shadow = { ...shadowTarget, samples: [], liveTokens: 0, pending: 0 };
+	if (modes.shadow) {
+		active.shadow = { ...modes.shadow, samples: [], liveTokens: 0, pending: 0 };
+		liveRegistry = ctx.modelRegistry as unknown as LiveRegistry;
+	}
+	if (modes.fork) {
+		active.fork = { ...modes.fork, maxLiveTokens: modes.fork.maxLiveTokens ?? 50_000, liveTokens: 0, forks: 0 };
 		liveRegistry = ctx.modelRegistry as unknown as LiveRegistry;
 	}
 	armed = active;
@@ -952,12 +1168,32 @@ function playCommand(
 		streamSimple: (model, context, options) => {
 			const current = armed;
 			if (!current) throw new Error("tape: replay is not armed");
+			const typed = model as unknown as { api: string; provider: string; id: string };
 			// The recorded answer is served either way; the shadow call only observes.
 			if (current.shadow && liveRegistry) {
 				void observeWithLiveModel(current, liveRegistry, context as { messages: unknown[] }, options);
 			}
+			// A fork asks a real model for a request the recording does not contain,
+			// instead of answering a new context with the next recorded event.
+			if (current.fork && liveRegistry) {
+				const prefix = entriesFromMessages((context as { messages: unknown[] }).messages);
+				if (!current.engine.lookupAssistant(prefix)) {
+					// A miss on the very first request is not a fork, it is a warning sign: the
+					// recording and pi disagree about what was asked, and every later request
+					// would be paid for.
+					if (current.fork.forks === 0 && current.engine.status().assistantConsumed === 0 && !current.fork.suspectMismatch) {
+						current.fork.suspectMismatch = true;
+						ctx.ui.notify(
+							"tape: the first request is not in the recording. That is usually a hash mismatch rather than\n" +
+								"a real divergence, so check /tape status before letting this fork spend tokens.",
+							"warning",
+						);
+					}
+					return createForkStream(current, liveRegistry, context as { messages: unknown[] }, options, typed);
+				}
+			}
 			return createReplayStream(
-				model as unknown as { api: string; provider: string; id: string },
+				typed,
 				context as unknown as { messages: unknown[] },
 				options as never,
 				current,
@@ -991,8 +1227,11 @@ function playCommand(
 
 				const outcome = current.engine.nextToolResultById(toolCallId);
 				if (outcome.kind === "miss") {
+					const text = current.fork
+						? `tape: no recorded result for tool call ${toolCallId}. This fork went live and produced a tool call the recording does not cover — pi-tape cannot run the real tool from inside a replay. Record a fresh tape, or run the procedure with \`pi-tape run\`.`
+						: `tape: ${outcome.reason}`;
 					return {
-						content: [{ type: "text", text: `tape: ${outcome.reason}` }],
+						content: [{ type: "text", text }],
 						details: { tape: "miss" },
 						isError: true,
 					};
@@ -1010,18 +1249,27 @@ function playCommand(
 	}
 
 	ctx.ui.setStatus(STATUS_KEY, `replay: ${tape.name ?? tape.id.slice(7, 15)}`);
-	ctx.ui.notify(
-		[
-			`tape armed → ${path}`,
-			`  recorded      ${tape.stats.assistantMessages} assistant / ${tape.stats.toolResults} tool results · $${tape.stats.costUsd.toFixed(4)}`,
-			`  tools replaced ${active.registeredTools.join(", ") || "(none)"}`,
-			"",
-			`Next: run  /model ${PROVIDER}/${modelId}`,
-			"then send the original first prompt. Every answer comes from the recording.",
-			"Leaving replay requires /reload — pi cannot unregister a tool.",
-		].join("\n"),
-		"info",
+	const lines = [
+		`tape armed → ${path}`,
+		`  recorded      ${tape.stats.assistantMessages} assistant / ${tape.stats.toolResults} tool results · $${tape.stats.costUsd.toFixed(4)}`,
+		`  tools replaced ${active.registeredTools.join(", ") || "(none)"}`,
+	];
+	if (active.fork) {
+		lines.push(
+			`  fork          a request the recording does not contain goes to ${active.fork.provider}/${active.fork.modelId}`,
+			`                budget ${active.fork.maxLiveTokens} live tokens; the recorded prefix stays free`,
+			"                a live tool call the recording lacks stops the run",
+		);
+	}
+	lines.push(
+		"",
+		`Next: run  /model ${PROVIDER}/${modelId}`,
+		active.fork
+			? "then send a prompt that diverges from the recording. Unchanged requests are served, new ones are asked."
+			: "then send the original first prompt. Every answer comes from the recording.",
+		"Leaving replay requires /reload — pi cannot unregister a tool.",
 	);
+	ctx.ui.notify(lines.join("\n"), "info");
 }
 
 
@@ -1041,6 +1289,12 @@ interface LiveRegistry {
 	streamSimple(model: unknown, context: unknown, options?: unknown): AsyncIterable<unknown>;
 }
 
+/** Token usage reported by the last message of a provider stream. */
+function tokensOfMessage(message: unknown): number {
+	const usage = (message as { usage?: { input?: number; output?: number; totalTokens?: number } } | undefined)?.usage;
+	return usage ? (usage.totalTokens ?? (usage.input ?? 0) + (usage.output ?? 0)) : 0;
+}
+
 /** Consume a provider stream, keeping the last whole message it produced. */
 async function collectLiveAnswer(
 	stream: AsyncIterable<unknown>,
@@ -1052,9 +1306,7 @@ async function collectLiveAnswer(
 		else if (item.type === "error") last = item.error;
 		else if (item.partial !== undefined) last = item.partial;
 	}
-	const usage = (last as { usage?: { input?: number; output?: number; totalTokens?: number } } | undefined)?.usage;
-	const tokens = usage ? (usage.totalTokens ?? (usage.input ?? 0) + (usage.output ?? 0)) : 0;
-	return { message: last, tokens };
+	return { message: last, tokens: tokensOfMessage(last) };
 }
 
 /** A short label for a turn, so a report can be navigated. */
@@ -1094,7 +1346,7 @@ async function observeWithLiveModel(
 
 	shadow.pending++;
 	try {
-		const stream = registry.streamSimple(target, context, options);
+		const stream = registry.streamSimple(target, context, liveCallOptions(options));
 		const live = await collectLiveAnswer(stream);
 		shadow.liveTokens += live.tokens;
 		shadow.samples.push({
@@ -1142,10 +1394,17 @@ function statusCommand(ctx: ExtensionCommandContext): void {
 			`  tools      ${status.toolConsumed}/${status.toolTotal} served`,
 			`  misses     ${misses.length}`,
 			...misses.slice(-3).map((miss) => `    · [${miss.kind}] ${miss.detail}`),
-			`  recorded   $${armed.tape.stats.costUsd.toFixed(4)} (this replay cost $0)`,
+			`  recorded   $${armed.tape.stats.costUsd.toFixed(4)} ${armed.fork ? "(plus the fork's live tokens)" : "(this replay cost $0)"}`,
 			armed.shadow
 				? `  shadow     ${armed.shadow.samples.length}/${armed.engine.assistantCount} compared against ` +
 					`${armed.shadow.provider}/${armed.shadow.modelId} · ${armed.shadow.liveTokens} tokens spent`
+				: "",
+			armed.fork
+				? `  fork       ${armed.fork.forks} request(s) the recording lacked → ` +
+					`${armed.fork.provider}/${armed.fork.modelId} · ${armed.fork.liveTokens}/${armed.fork.maxLiveTokens} tokens` +
+					(armed.fork.suspectMismatch
+						? "\n  fork       ! the first request missed the recording — treat that as a hash mismatch until proven otherwise"
+						: "")
 				: "",
 		]
 			.filter(Boolean)
@@ -1189,14 +1448,8 @@ export default function (pi: ExtensionAPI) {
 				case "shadow": {
 					// `--model provider/id` names the model to compare against; the
 					// recording is still what gets served.
-					const parts = rest.trim().split(/\s+/).filter(Boolean);
-					const modelArgument = parts.find((part) => part === "--model" || part.startsWith("--model="));
-					const modelValue =
-						modelArgument === "--model"
-							? parts[parts.indexOf("--model") + 1]
-							: modelArgument?.slice("--model=".length);
-					const file = parts.filter((part) => part !== "--model" && part !== modelValue).join(" ");
-					if (!modelValue || !modelValue.includes("/")) {
+					const { file, target } = parseArmArguments(rest);
+					if (!target) {
 						ctx.ui.notify(
 							"Usage: /tape shadow <file.tape> --model <provider>/<model>\n" +
 								"The recording is served as usual; the named model is asked the same requests.",
@@ -1204,8 +1457,28 @@ export default function (pi: ExtensionAPI) {
 						);
 						return;
 					}
-					const [provider, ...idParts] = modelValue.split("/");
-					playCommand(pi, file, ctx, { provider: provider as string, modelId: idParts.join("/") });
+					playCommand(pi, file, ctx, { shadow: target });
+					return;
+				}
+				case "fork": {
+					// `--model provider/id` answers a request the recording lacks, so a run
+					// can continue past the recording instead of being served the next
+					// recorded event for a context that is not the one asked about.
+					const { file, target, maxLiveTokens, error } = parseArmArguments(rest);
+					if (error) {
+						ctx.ui.notify(`tape: ${error}`, "warning");
+						return;
+					}
+					if (!target) {
+						ctx.ui.notify(
+							"Usage: /tape fork <file.tape> --model <provider>/<model> [--max-live-tokens N]\n" +
+								"Served from the recording while the prefix matches; asked of the model when it does not.\n" +
+								"The token budget defaults to 50000 and stops the run instead of overspending.",
+							"warning",
+						);
+						return;
+					}
+					playCommand(pi, file, ctx, { fork: { ...target, ...(maxLiveTokens === undefined ? {} : { maxLiveTokens }) } });
 					return;
 				}
 				case "regress": {
@@ -1282,8 +1555,10 @@ export default function (pi: ExtensionAPI) {
 							"  /tape play <file>        arm deterministic replay from a recording",
 							"  /tape shadow <file> --model <provider>/<model>",
 							"                           replay, and ask another model the same requests",
+							"  /tape fork <file> --model <provider>/<model>",
+							"                           serve the recording, ask the model where it ends",
 							"  /tape regress            what the shadow model answered differently",,
-							"  /tape status             replay progress, misses, shadow progress",
+							"  /tape status             replay progress, misses, shadow and fork progress",
 							"  /tape stop               disarm (then /reload to restore real tools)",
 							"  /tape library            list the recipe store",
 							"  /tape index              rebuild the recipe graph index",
