@@ -704,3 +704,13 @@ test("a path inside the project is portable; one outside it is not", async () =>
 	assert.equal(isPortablePath("/home/alice/tool"), false);
 	assert.equal(isPortablePath("~/bin/tool"), false);
 });
+
+test("recordedPrompts lists the user prompts in order, leaving out compaction summaries", () => {
+	const session = parseSession(compactedSession().text);
+	const { tape } = recordSession(session);
+	const engine = new ReplayEngine(tape);
+	assert.deepEqual(engine.recordedPrompts(), ["read a.txt", "and now?"]);
+	assert.equal(engine.nextCompactionPoint(), 2, "the recording compacted after two answers");
+	assert.ok(engine.takeCompaction(2));
+	assert.equal(engine.nextCompactionPoint(), undefined, "a served compaction is not offered again");
+});

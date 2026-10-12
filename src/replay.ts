@@ -23,8 +23,8 @@
  */
 
 import type { ReplayOutcome, SessionEntry, SessionFile, TapeFile } from "./types.ts";
-import { messageOf, parseSession, toolCallsOf } from "./session.ts";
-import { hashPrefix, stableStringify, type HashContext } from "./hash.ts";
+import { contentBlocks, messageOf, parseSession, toolCallsOf } from "./session.ts";
+import { compactionSummaryOf, hashPrefix, stableStringify, type HashContext } from "./hash.ts";
 import { resolveEntries } from "./tape.ts";
 
 export interface ReplayDiagnostic {
@@ -369,6 +369,30 @@ export class ReplayEngine {
 	/** Compactions in the recording. */
 	get compactionCount(): number {
 		return this.compactions.length;
+	}
+
+	/** How many recorded answers came before the next compaction not yet served, if any. */
+	nextCompactionPoint(): number | undefined {
+		return this.compactions.find((item) => !item.consumed)?.assistantsBefore;
+	}
+
+	/**
+	 * What the user typed, in the order it was sent — the prompts a run replays.
+	 * A compaction summary is pi's, not the user's, and is left out.
+	 */
+	recordedPrompts(): string[] {
+		const prompts: string[] = [];
+		for (const entry of this.entries) {
+			const message = messageOf(entry);
+			if (message?.role !== "user") continue;
+			if (compactionSummaryOf(message) !== undefined) continue;
+			const text = contentBlocks(message)
+				.map((block) => (typeof block.text === "string" ? block.text : ""))
+				.join("")
+				.trim();
+			if (text) prompts.push(text);
+		}
+		return prompts;
 	}
 
 	/** Total recorded assistant events, for progress reporting. */

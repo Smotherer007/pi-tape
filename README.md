@@ -73,15 +73,14 @@ been wrong anyway?
 
 ```
 /tape record wrong
-/tape fork wrong.tape --model deepseek/deepseek-flash --at 1 --result The service listens on port 8080.
-/model tape/deepseek-flash
-Which port does the service listen on? Read notes.md and answer with the number.
+/tape fork wrong.tape --model deepseek/deepseek-flash --run --at 1 --result The service listens on port 8080.
 # → 8080
 /tape record corrected
 ```
 
 `--at 1` is the first tool call of the recording (the read of `notes.md`); `--result`
-takes the rest of the line, or `@file` for something longer.
+takes the rest of the line, or `@file` for something longer. `--run` sends the
+recording's own prompt, so nothing has to be retyped.
 
 The first request came from the recording. The read of `notes.md` returned the
 corrected text instead of the file. Only the answer after it was asked of the model —
@@ -143,12 +142,17 @@ Context cost per tool (result characters)
 ### Replay
 
 ```
-/tape play baseline.tape     # arm the replay
-/model tape/<model>          # switch to the replay provider (the notice names it)
-<send the original first prompt>
-/tape status                 # progress, misses, what the recording cost
-/tape stop                   # disarm; /reload restores the real tools
+/tape play baseline.tape --run   # arm, switch to the tape model, send the recorded prompts
+/tape status                     # progress, misses, what the recording cost
+/tape stop                       # disarm; /reload restores the real tools
 ```
+
+`--run` works the same for `fork` and `shadow`: pi-tape switches to the tape model,
+sends each recorded prompt in order, waits for that run to finish, asks for a
+compaction where the recording made one, and prints the status (or, for a shadow,
+the regression report) at the end. It stops early when a run is aborted, the replay
+is disarmed, or a fork stops before its intervention. Without `--run` you drive it by
+hand: `/model tape/<model>` (the notice names it), then the original prompts.
 
 Every answer and every tool result comes from the recording. A replay keeps working
 when pi compacts the conversation along the way, when the thinking level differs from
@@ -158,6 +162,7 @@ the recording, and with parallel tool calls.
 
 ```
 /tape fork <file> --model <provider>/<model> [options]
+  --run                                          send the recorded prompts, then report
   --at <turn|toolCallId> --result <text|@file>   answer that tool call differently
   --live-tools read,grep                         let these run for real past the change
   --max-live-tokens N                            optional cap on what the branch may spend
@@ -202,10 +207,8 @@ A shadow run serves the recording — the trajectory stays fixed — and asks a 
 same request at every recorded step, with whatever it is configured with *now*:
 
 ```
-/tape shadow golden.tape --model <provider>/<model>
-/model tape/<recorded model>
-<the original first prompt>
-/tape regress
+/tape shadow golden.tape --model <provider>/<model> --run
+# → the regression report, once every comparison is in
 ```
 
 **A model upgrade:** shadow with the new model.
@@ -232,13 +235,20 @@ stand out from. [`bench/knowledge-regression.mjs`](bench/knowledge-regression.mj
 that control, a harmless rewording and a real regression in one go.
 
 How far that gets you, measured: with a scripted model the deleted rule is caught at the
-step it matters and the control and the rewording stay quiet. With DeepSeek Flash, the
-control already differed from the recording in 3 of 6 steps — the model searched with
-other words, `cd`'d first, or decided to inspect the tool instead of logging in. Part of
-that was the comparison being too strict (lookups, `cd` and timeouts are no longer
-counted as actions); the rest is the model. So read a shadow report as a step-by-step
-account of what changed, and compare it with the control before you call anything a
-regression.
+step it matters, and the control and the rewording stay quiet. With DeepSeek Flash they
+do not separate. Out of 7 recorded steps, the actions that differed were:
+
+| setup | shadow 1 | shadow 2 |
+|---|---|---|
+| unchanged (control) | 2 | 4 |
+| reworded | 3 | 3 |
+| rule deleted | 5 | 3 |
+
+The model's own variation — searching with other words, inspecting the tool before
+logging in, decompressing it to read the source — is as large as the effect of the
+change. Lookups, `cd`, echoes and timeouts are already left out of the comparison; what
+remains is the model. So a shadow report is a step-by-step account for a person to read
+next to the control, not a pass/fail gate.
 
 ### Recipes (experimental)
 
@@ -282,8 +292,8 @@ They drive pi over RPC and check results in the world — files on disk, a tool'
 |---|---|---|
 | [`replay-check`](bench/replay-check.mjs) | record; change the files on disk; replay, also at another thinking level; fork with an intervention | 9 of 9, in a setup with ~200 tools from other extensions |
 | [`prove`](bench/prove.mjs) | a longer run with parallel tool calls and a compaction; replay compacting at the same point; fork *after* the compaction with thinking on; the debugging case above | 14 of 14 |
-| [`knowledge-regression`](bench/knowledge-regression.mjs) | shadow a recorded run with unchanged, reworded and broken `AGENTS.md`; then run the broken one for real | scripted model: caught at the right step, control and rewording quiet. DeepSeek Flash: the control itself differed in 3 of 6 steps — noise as large as the signal |
-| [`recipe-experiment`](bench/recipe-experiment.mjs) | recipes vs. the agent's own notes vs. nothing, on deployments the training runs never did, with a readable and a sealed tool | no saving; fewest failed calls with recipes (below) |
+| [`knowledge-regression`](bench/knowledge-regression.mjs) | shadow a recorded run with unchanged, reworded and broken `AGENTS.md`; then run the broken one for real | scripted model: caught at the right step, control and rewording quiet. DeepSeek Flash: control, rewording and regression do not separate |
+| [`recipe-experiment`](bench/recipe-experiment.mjs) | recipes vs. the agent's own notes vs. nothing, on deployments the training runs never did, with a readable and a sealed tool | the right recipe is learned; it saves nothing (below) |
 
 **The checks found what the unit tests could not.** Each of these passed every unit
 test and failed against real pi:
@@ -299,32 +309,43 @@ test and failed against real pi:
 
 **Recipes did not pay off in the measured setting.** Three training runs were recorded
 with a small in-house deploy tool, the agent wrote notes after each, and pi-tape spliced
-the recordings into a recipe. Then three deployments the training never did ran three
-times each per condition — once with the tool readable, once with it *sealed*
-(compressed, so its source does not show the procedure):
+the recordings. The recipe it learned is the right one:
 
-| tool | condition | success | without a failed call | requests | tokens | cost |
-|---|---|---|---|---|---|---|
-| readable | nothing | 9/9 | 8/9 | 5.2 | 36,700 | $0.0026 |
-| readable | the agent's own notes | 9/9 | 3/9 | 4.3 | 32,400 | $0.0030 |
-| readable | recipe | 9/9 | 7/9 | 6.1 | 45,900 | $0.0031 |
-| sealed | nothing | 9/9 | 8/9 | 6.4 | 51,100 | $0.0037 |
-| sealed | the agent's own notes | 9/9 | 2/9 | 4.9 | 40,000 | $0.0036 |
-| sealed | recipe | 9/9 | 9/9 | 6.2 | 52,700 | $0.0041 |
+```
+./shipit login --token-file .shipit-token
+./shipit deploy {{arg}} --env {{env}}
+seen in some runs only:
+  ./shipit bump {{arg}}   — in 1 of 3 runs, before step 2, when env=prod
+```
+
+Then three deployments the training never did ran three times each per condition — with
+the tool readable, and with it *sealed* (compressed, so its source does not show the
+procedure). Every working folder was isolated from the others:
+
+| tool | condition | success | requests | tokens | cost |
+|---|---|---|---|---|---|
+| readable | nothing | 9/9 | 4.9 | 32,100 | $0.0024 |
+| readable | the agent's own notes | 9/9 | 5.1 | 38,400 | $0.0032 |
+| readable | recipe | 9/9 | 5.9 | 41,500 | $0.0028 |
+| sealed | nothing | 9/9 | 5.4 | 40,200 | $0.0031 |
+| sealed | the agent's own notes | 9/9 | 4.9 | 39,300 | $0.0035 |
+| sealed | recipe | 9/9 | 6.0 | 49,500 | $0.0035 |
 
 What it says:
 
-- **No memory made the runs cheaper.** The notes saved a request or so and caused the
-  most failed calls; the recipe cost the most, mostly in looking it up.
-- **The recipe runs failed least** — 9 of 9 without a single failed call on the sealed
-  tool. With nine runs per cell that is a hint, not a result.
+- **No memory made the runs cheaper or more successful.** Running with nothing was the
+  cheapest in both variants; the recipe cost about one request more, spent on looking it
+  up and reading it.
 - **Exploring was never expensive.** Every condition succeeded every time, in five to
   six requests. The sealed tool did not stay sealed: the model decompressed it with
   `node -e` and read the source.
+- **Failed tool calls do not separate the conditions.** An earlier run suggested that
+  recipes led to fewer of them; the isolated rerun did not repeat it. Most "failed"
+  calls were a `cat` of a state file the notes mention, made before the file existed.
 
 That matches the research rather than contradicting it: learned procedures pay where
-finding the way is long and costly, and a capable model with a shell finds most small
-procedures by itself. Recipes stay an experiment. Where they could matter — long
+finding the way is long and costly, and a capable model with a shell finds a small
+procedure by itself. Recipes stay an experiment. Where they could matter — long
 procedures, steps that cannot be inspected, tries that cost real time or money — has
 not been measured here.
 
@@ -441,9 +462,9 @@ settings nor your MCP servers nor your tool versions. Specification:
 | | |
 |---|---|
 | `/tape record [name] [--redact] [--status s]` | write this session to a `.tape` file |
-| `/tape play <file>` | arm a deterministic replay |
-| `/tape fork <file> --model <p>/<m> [--at … --result …] [--live-tools a,b] [--max-live-tokens N]` | replay, then continue live where the recording ends or is changed |
-| `/tape shadow <file> --model <p>/<m>` | replay, and ask that model the same requests |
+| `/tape play <file> [--run]` | arm a deterministic replay; `--run` also sends the recorded prompts |
+| `/tape fork <file> --model <p>/<m> [--run] [--at … --result …] [--live-tools a,b] [--max-live-tokens N]` | replay, then continue live where the recording ends or is changed |
+| `/tape shadow <file> --model <p>/<m> [--run]` | replay, and ask that model the same requests |
 | `/tape regress` | what the shadow model would have done differently |
 | `/tape status` | progress, misses, compactions served, what a fork or shadow spent |
 | `/tape stop` | disarm (then `/reload` to restore the real tools) |
@@ -499,8 +520,8 @@ A debugger that lies is worse than none, so:
   old recording is not a faithful counterfactual. Only pi's built-in tools can be run
   this way; another tool named there is left alone, and its recorded calls run again.
 - **Shadow comparisons carry the model's own noise.** A model does not answer the same
-  request the same way twice; measured with DeepSeek Flash, an unchanged setup already
-  differed in half of the steps. Compare every report with a control, and do not use a
+  request the same way twice; measured with DeepSeek Flash, an unchanged setup differed
+  in two to four of seven steps, as much as a deliberately broken one. Compare every report with a control, and do not use a
   single shadow run as an automatic pass/fail gate.
 - **Checked against one provider.** The `bench/` checks ran with DeepSeek Flash.
   Providers that sign their reasoning (Anthropic) are the open case for a fork, because
@@ -516,12 +537,16 @@ A debugger that lies is worse than none, so:
 - **`pi-tape run` executes recorded command lines.** It plans by default, quotes the
   values it binds, refuses a short list of destructive commands and stops at the first
   failure — a floor, not a sandbox. Read the plan before `--yes`.
-- **Not implemented:** forking from the UI, replaying image payloads.
+- **`--run` sends prompts one run at a time.** A message the recording received while
+  the agent was still working (steering, a follow-up typed mid-run) is sent as its own
+  prompt after the run, so that part of a replay may miss.
+- **Not implemented:** picking a fork point interactively (use `inspect --timeline`
+  and `--at`), replaying image payloads.
 
 ## Development
 
 ```bash
-npm test                  # 213 tests, node:test, no agent started
+npm test                  # 217 tests, node:test, no agent started
 npm run typecheck         # a separate gate: code has run green while carrying type errors
 npm run build             # dist/, only needed to publish
 node bench/prove.mjs      # against a real pi and model; reports in .tape/check/

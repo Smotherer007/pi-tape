@@ -359,10 +359,7 @@ about a different model. `/tape shadow` closes that: the recording is still serv
 and the named model is asked the same requests in parallel.
 
 ```
-/tape shadow auth-refactor.tape --model anthropic/claude-sonnet-4-5
-/model tape/<recorded-model>
-<send the original first prompt>
-/tape regress
+/tape shadow auth-refactor.tape --model anthropic/claude-sonnet-4-5 --run
 ```
 
 The comparison (`src/regress.ts`) is strict about structure and lenient about
@@ -388,9 +385,8 @@ change at turn 7 re-asks turn 7 and after, and turns 1–6 stay free.
 
 ```
 /tape fork auth-refactor.tape --model anthropic/claude-sonnet-4-5
-/tape fork auth-refactor.tape --model anthropic/claude-sonnet-4-5
 /model tape/<recorded-model>
-<send a prompt that diverges from the recording, or edit a tool result>
+<send a prompt that diverges from the recording>
 /tape status
 ```
 
@@ -406,10 +402,7 @@ result*: replay the recording up to one tool call, put something else in its pla
 and let a real model continue from there.
 
 ```
-/tape fork deploy.tape --model anthropic/claude-sonnet-4-5 \
-  --at 3 --result 'error: registry unreachable'
-/model tape/<recorded-model>
-<send the recorded first prompt>
+/tape fork deploy.tape --model anthropic/claude-sonnet-4-5 --run --at 3 --result error: registry unreachable
 ```
 
 The turns before the intervention are served from the tape and cost nothing. The

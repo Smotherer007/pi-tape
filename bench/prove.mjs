@@ -28,6 +28,7 @@
  * Environment (optional):
  *   PI_MODELS="anthropic/claude-haiku-4-5,deepseek/deepseek-flash"   which models to prove
  *   PI_BIN=/path/to/pi                                                 which pi to run
+ *   PI_PROVE=debug                                                     only the debugging case
  *   TAPE_EXT=/path/to/extensions/index.(ts|js)                         which pi-tape to load
  */
 import { execFileSync, spawn, spawnSync } from "node:child_process";
@@ -137,7 +138,7 @@ function startPi(cwd, label, extra = []) {
 		process.exit(1);
 	});
 	let counter = 0;
-	async function send(command, { waitForRun = false, timeoutMs = 300_000 } = {}) {
+	async function send(command, { waitForRun = false, until, timeoutMs = 300_000 } = {}) {
 		const id = `${label}-${++counter}`;
 		const start = events.length;
 		child.stdin.write(JSON.stringify({ ...command, id }) + "\n");
@@ -145,7 +146,12 @@ function startPi(cwd, label, extra = []) {
 		let response;
 		while (Date.now() < deadline) {
 			response ??= events.slice(start).find((r) => r.type === "response" && r.id === id);
-			if (response) {
+			if (until) {
+				if (until(events.slice(start))) {
+					await sleep(500);
+					break;
+				}
+			} else if (response) {
 				if (!response.success) break;
 				if (!(waitForRun && response.data?.disposition === "started")) {
 					await sleep(1200);
@@ -350,17 +356,17 @@ async function proveDebugging(model) {
 		return;
 	}
 
-	log(`\n### 4b · hypothesis: the stale note caused it — fork with only that note corrected`);
+	log(`\n### 4b · hypothesis: the stale note caused it — fork with only that note corrected, one command`);
 	pi = startPi(dir, "dbgfork", modelArgs);
-	await pi.send({
-		type: "prompt",
-		message: `/tape fork wrong.tape --model ${model.provider}/${model.id} --at ${turn} --result # Service notes\n\nThe service listens on port 8080.`,
-	});
-	await pi.send({ type: "set_model", provider: "tape", modelId: model.id });
-	run = await pi.send({ type: "prompt", message: ask }, { waitForRun: true });
+	run = await pi.send(
+		{
+			type: "prompt",
+			message: `/tape fork wrong.tape --model ${model.provider}/${model.id} --run --at ${turn} --result # Service notes\n\nThe service listens on port 8080.`,
+		},
+		{ until: (events) => events.some((r) => r.type === "extension_ui_request" && /tape replay ←|stopped after|could not switch/.test(String(r.message))) },
+	);
 	const forked = describe(run.events);
-	run = await pi.send({ type: "prompt", message: "/tape status" });
-	describe(run.events);
+	const forkStatus = notices(run.events);
 	await pi.send({ type: "prompt", message: "/tape record corrected" });
 	await pi.stop();
 	const fixedAnswer = lastText(forked.answers);
@@ -369,6 +375,7 @@ async function proveDebugging(model) {
 	check(scope, /3000/.test(wrongAnswer) && !/8080/.test(wrongAnswer), `the original run answered from the stale note (${short(wrongAnswer, 40)})`);
 	check(scope, /8080/.test(fixedAnswer), `with only the note corrected, the answer is right (${short(fixedAnswer, 40)})`);
 	check(scope, forked.tools.some((t) => t.source === "override"), "the fork replaced exactly the note, nothing else was re-run");
+	check(scope, /running 1 recorded prompt/.test(forkStatus) && /tape replay ←/.test(forkStatus), "one command: --run sent the recorded prompt itself and reported");
 	try {
 		const cli = join(REPO, "src", "cli.ts");
 		const diff = execFileSync(process.execPath, [cli, "diff", join(dir, "wrong.tape"), join(dir, "corrected.tape")], { encoding: "utf8", timeout: 30_000 });
@@ -417,7 +424,7 @@ async function main() {
 		log("no model to prove — set PI_MODELS");
 		return;
 	}
-	for (const model of models) {
+	for (const model of process.env.PI_PROVE === "debug" ? [] : models) {
 		try {
 			await proveModel(model);
 		} catch (error) {

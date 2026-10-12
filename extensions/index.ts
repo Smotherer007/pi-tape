@@ -187,6 +187,15 @@ interface Armed {
 /** Module state: undefined means capture/live mode. */
 let armed: Armed | undefined;
 
+/** `--run` callers waiting for the current agent run to settle. */
+let settleWaiters: Array<(event: { aborted?: boolean }) => void> = [];
+
+function releaseSettleWaiters(event: { aborted?: boolean }): void {
+	const waiting = settleWaiters;
+	settleWaiters = [];
+	for (const resolve of waiting) resolve(event);
+}
+
 /**
  * The model registry, captured when a shadow run is armed.
  *
@@ -1408,6 +1417,8 @@ async function runLiveTool(
 
 /** Modes a replay can be armed in. A plain replay is neither. */
 interface PlayModes {
+	/** `--run`: pi-tape sends the recorded prompts itself, so the "Next:" hint is not needed. */
+	run?: boolean;
 	/** Ask this model the same requests in the background, while serving the recording. */
 	shadow?: { provider: string; modelId: string };
 	/** Ask this model a request the recording does not contain, instead of the next recorded event. */
@@ -1687,14 +1698,18 @@ function playCommand(
 			"                until the recording's next change; anything else is asked of the real tool or stops",
 		);
 	}
-	lines.push(
-		"",
-		`Next: run  /model ${PROVIDER}/${modelId}`,
-		active.fork
-			? "then send a prompt that diverges from the recording. Unchanged requests are served, new ones are asked."
-			: "then send the original first prompt. Every answer comes from the recording.",
-		"Leaving replay requires /reload — pi cannot unregister a tool.",
-	);
+	if (modes.run) {
+		lines.push("", "Running: pi-tape switches to the tape model and sends the recorded prompts itself.");
+	} else {
+		lines.push(
+			"",
+			`Next: run  /model ${PROVIDER}/${modelId}`,
+			active.fork
+				? "then send a prompt that diverges from the recording. Unchanged requests are served, new ones are asked."
+				: "then send the original first prompt. Every answer comes from the recording.",
+		);
+	}
+	lines.push("Leaving replay requires /reload — pi cannot unregister a tool.");
 	ctx.ui.notify(lines.join("\n"), "info");
 }
 
@@ -1805,6 +1820,87 @@ function shadowReport(active: Armed): RegressionReport {
 	return summarizeRegression(report);
 }
 
+/**
+ * `--run`: drive the armed recording without the user retyping it.
+ *
+ * Switches to the tape model, then sends each recorded user prompt in order and waits
+ * for that run to settle before the next one. A compaction the recording made between
+ * two prompts is requested at the same point, so the recorded summary is served there.
+ * The loop stops when the run is aborted, the replay is disarmed, or a fork stopped
+ * before its intervention — continuing would only ask questions the recording cannot
+ * answer. At the end it prints what `/tape status` (or `/tape regress`) would.
+ */
+async function runRecording(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+	const current = armed;
+	if (!current) return;
+
+	const model = ctx.modelRegistry.find(PROVIDER, current.modelId);
+	if (!model || !(await pi.setModel(model as never))) {
+		ctx.ui.notify(`tape: could not switch to ${PROVIDER}/${current.modelId}; run it by hand with /model.`, "error");
+		return;
+	}
+
+	const prompts = current.engine.recordedPrompts();
+	if (!prompts.length) {
+		ctx.ui.notify("tape: the recording contains no user prompt to send.", "warning");
+		return;
+	}
+	ctx.ui.notify(`tape: running ${prompts.length} recorded prompt(s).`, "info");
+
+	let sent = 0;
+	let stoppedEarly: string | undefined;
+	for (const text of prompts) {
+		if (armed !== current) {
+			stoppedEarly = "the replay was disarmed";
+			break;
+		}
+		await ctx.waitForIdle();
+
+		// A compaction the recording made before this prompt, and that pi did not already
+		// trigger on its own, is asked for here — the session_before_compact hook serves it.
+		const point = current.engine.nextCompactionPoint();
+		if (point !== undefined && point === current.engine.status().assistantConsumed) {
+			await new Promise<void>((done) =>
+				ctx.compact({
+					onComplete: () => done(),
+					onError: (error) => {
+						ctx.ui.notify(
+							`tape: the recording compacted here, but pi would not (${error.message}); continuing without it.`,
+							"warning",
+						);
+						done();
+					},
+				}),
+			);
+			await ctx.waitForIdle();
+		}
+
+		const settled = new Promise<{ aborted?: boolean }>((done) => settleWaiters.push(done));
+		pi.sendUserMessage(text);
+		const outcome = await settled;
+		sent++;
+		if (outcome.aborted) {
+			stoppedEarly = "the run was aborted";
+			break;
+		}
+		if (current.fork?.stoppedBeforeIntervention) {
+			stoppedEarly = "the fork stopped before its intervention";
+			break;
+		}
+	}
+	if (armed !== current) return;
+
+	if (stoppedEarly) {
+		ctx.ui.notify(`tape: stopped after ${sent}/${prompts.length} prompt(s) — ${stoppedEarly}.`, "warning");
+	}
+	if (current.shadow) {
+		while (current.shadow.pending > 0) await new Promise((done) => setTimeout(done, 100));
+		ctx.ui.notify(formatRegression(shadowReport(current)), "info");
+		return;
+	}
+	statusCommand(ctx);
+}
+
 function statusCommand(ctx: ExtensionCommandContext): void {
 	if (!armed) {
 		ctx.ui.notify("tape: record mode. Use /tape record [name], or /tape play <file.tape>.", "info");
@@ -1869,6 +1965,11 @@ export default function (pi: ExtensionAPI) {
 		return { systemPrompt: `${systemPrompt}${block}` };
 	});
 
+	// `--run` waits for a run to settle before sending the next recorded prompt.
+	pi.on("agent_settled", (event) => {
+		releaseSettleWaiters(event as { aborted?: boolean });
+	});
+
 	// A compaction during a replay asks the current model — the tape — for a summary.
 	// Left alone, that request would be answered with the next recorded event (a tool
 	// call, usually), pi would reject it, and the replay would be one answer short from
@@ -1914,14 +2015,19 @@ export default function (pi: ExtensionAPI) {
 			const trimmed = args.trim();
 			const space = trimmed.indexOf(" ");
 			const sub = space === -1 ? trimmed : trimmed.slice(0, space);
-			const rest = space === -1 ? "" : trimmed.slice(space + 1);
+			const raw = space === -1 ? "" : trimmed.slice(space + 1);
+			// `--run`: arm, then send the recording's own prompts, one run after another.
+			const run = /(^|\s)--run(?=\s|$)/.test(raw);
+			const rest = run ? raw.replace(/(^|\s)--run(?=\s|$)/g, " ").replace(/\s+/g, " ").trim() : raw;
+			const before = armed;
 
 			switch (sub) {
 				case "record":
 					recordCommand(rest, ctx);
 					return;
 				case "play":
-					playCommand(pi, rest, ctx);
+					playCommand(pi, rest, ctx, { run });
+					if (run && armed && armed !== before) await runRecording(pi, ctx);
 					return;
 				case "shadow": {
 					// `--model provider/id` names the model to compare against; the
@@ -1935,7 +2041,8 @@ export default function (pi: ExtensionAPI) {
 						);
 						return;
 					}
-					playCommand(pi, file, ctx, { shadow: target });
+					playCommand(pi, file, ctx, { shadow: target, run });
+					if (run && armed && armed !== before) await runRecording(pi, ctx);
 					return;
 				}
 				case "fork": {
@@ -1982,7 +2089,9 @@ export default function (pi: ExtensionAPI) {
 							...(at === undefined || replacement === undefined ? {} : { at, result: replacement }),
 							...(liveTools === undefined ? {} : { liveTools }),
 						},
+						run,
 					});
+					if (run && armed && armed !== before) await runRecording(pi, ctx);
 					return;
 				}
 				case "regress": {
@@ -2012,6 +2121,7 @@ export default function (pi: ExtensionAPI) {
 					pi.unregisterProvider(PROVIDER);
 					armed = undefined;
 					liveRegistry = undefined;
+					releaseSettleWaiters({ aborted: true });
 					ctx.ui.setStatus(STATUS_KEY, undefined);
 					ctx.ui.notify(
 						"Replay disarmed. Tool overrides stay registered until /reload, and will refuse to run.",

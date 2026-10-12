@@ -16,7 +16,7 @@ import tape from "../extensions/index.ts";
 import { recordSession } from "../src/record.ts";
 import { parseSession, pathToLeaf } from "../src/session.ts";
 import { readTape } from "../src/tape.ts";
-import { buildFixture, compactedSession } from "./fixtures.ts";
+import { buildFixture, compactedSession, compactionMessage } from "./fixtures.ts";
 
 interface Captured {
 	commands: Map<string, (args: string, ctx: unknown) => Promise<void> | void>;
@@ -1027,6 +1027,149 @@ test("/tape record takes --status, as the CLI does, instead of putting it in the
 		await handler("record other --status great", fakeCtx(dir, session.entries));
 		assert.match(capturedNotices.join("\n"), /--status expects success, failed or unknown/);
 		assert.equal(existsSync(join(dir, "other.tape")), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// --run: one command drives the whole recording
+// ---------------------------------------------------------------------------
+
+/**
+ * A minimal agent loop standing in for pi: a prompt goes to the current model
+ * (the tape provider), tool calls go to the registered tools, and the run ends
+ * with `agent_settled`. Compaction asks `session_before_compact`, as pi does.
+ */
+function runnableHarness(options: { abortAfter?: number } = {}) {
+	capturedNotices = [];
+	capturedStatuses = [];
+	const { pi, captured } = fakePi();
+	const sent: string[] = [];
+	const models: Array<Record<string, unknown>> = [];
+	let messages: Array<Record<string, unknown>> = [];
+	let compactions = 0;
+
+	fakeRegistry = { find: (provider: string, id: string) => ({ provider, id, api: "tape-replay" }) };
+
+	async function runAgent(text: string): Promise<void> {
+		messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+		for (let step = 0; step < 10; step++) {
+			const stream = streamOf(captured)(models.at(-1), { messages: [...messages] });
+			for await (const _event of stream) void _event;
+			const answer = await stream.result();
+			messages.push(answer);
+			const calls = ((answer.content as Array<Record<string, unknown>>) ?? []).filter((b) => b.type === "toolCall");
+			if (answer.stopReason !== "toolUse" || !calls.length) break;
+			for (const call of calls) {
+				const tool = captured.tools.get(String(call.name)) as {
+					execute: (id: string, params: unknown) => Promise<{ content: unknown[]; isError?: boolean }>;
+				};
+				const result = await tool.execute(String(call.id), call.arguments);
+				messages.push({
+					role: "toolResult",
+					toolCallId: call.id,
+					toolName: call.name,
+					content: result.content,
+					isError: result.isError ?? false,
+					timestamp: Date.now(),
+				});
+			}
+		}
+		const settled = captured.handlers.get("agent_settled") as (event: unknown, ctx: unknown) => unknown;
+		await settled({ type: "agent_settled", aborted: options.abortAfter === sent.length }, {});
+	}
+
+	Object.assign(pi, {
+		async setModel(model: Record<string, unknown>) {
+			models.push(model);
+			return true;
+		},
+		sendUserMessage(text: string) {
+			sent.push(text);
+			setImmediate(() => void runAgent(text));
+		},
+	});
+	tape(pi as never);
+	activeHandler = captured.commands.get("tape");
+
+	function ctx(dir: string, entries: unknown[]) {
+		return {
+			...fakeCtx(dir, entries),
+			waitForIdle: async () => {},
+			compact(callbacks: { onComplete?: () => void; onError?: (error: Error) => void }) {
+				const hook = captured.handlers.get("session_before_compact") as (event: unknown, c: unknown) => unknown;
+				void Promise.resolve(hook({ preparation: { firstKeptEntryId: "live" } }, fakeCtx(dir, entries))).then(
+					(result) => {
+						const compaction = (result as { compaction?: { summary: string } } | undefined)?.compaction;
+						if (compaction) {
+							compactions++;
+							// pi keeps the entries from firstKeptEntryId on; in this fixture, the last answer.
+							messages = [compactionMessage(compaction.summary), messages.at(-1) as Record<string, unknown>];
+						}
+						callbacks.onComplete?.();
+					},
+				);
+			},
+		};
+	}
+
+	return { captured, sent, models, ctx, compactions: () => compactions };
+}
+
+test("/tape play --run sends the recorded prompts itself, compacts where the recording did, and reports", async () => {
+	const harness = runnableHarness();
+	const dir = mkdtempSync(join(tmpdir(), "tape-"));
+	try {
+		const session = parseSession(compactedSession().text);
+		const handler = harness.captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record compacted", harness.ctx(dir, session.entries));
+		await handler("play compacted.tape --run", harness.ctx(dir, session.entries));
+
+		assert.equal(harness.models.length, 1, "switched to the tape model once");
+		assert.equal(harness.models[0]?.provider, "tape");
+		assert.deepEqual(harness.sent, ["read a.txt", "and now?"], "the recorded prompts, in order, without the summary");
+		assert.equal(harness.compactions(), 1, "the recorded compaction was asked for between the two prompts");
+
+		const notices = capturedNotices.join("\n");
+		assert.match(notices, /running 2 recorded prompt\(s\)/);
+		assert.match(notices, /assistant {2}3\/3 served/);
+		assert.match(notices, /misses {5}0/);
+		assert.match(notices, /compaction 1 served from the recording/);
+		assert.doesNotMatch(notices, /Next: run/, "no instructions to do by hand what --run just did");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("--run stops when a run is aborted, and says how far it got", async () => {
+	const harness = runnableHarness({ abortAfter: 1 });
+	const dir = mkdtempSync(join(tmpdir(), "tape-"));
+	try {
+		const session = parseSession(compactedSession().text);
+		const handler = harness.captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record aborted", harness.ctx(dir, session.entries));
+		await handler("play --run aborted.tape", harness.ctx(dir, session.entries));
+
+		assert.deepEqual(harness.sent, ["read a.txt"]);
+		assert.match(capturedNotices.join("\n"), /stopped after 1\/2 prompt\(s\) — the run was aborted/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("--run does not drive a replay that was already armed before the command", async () => {
+	const harness = runnableHarness();
+	const dir = mkdtempSync(join(tmpdir(), "tape-"));
+	try {
+		const session = parseSession(compactedSession().text);
+		const handler = harness.captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record twice", harness.ctx(dir, session.entries));
+		await handler("play twice.tape", harness.ctx(dir, session.entries));
+		await handler("play twice.tape --run", harness.ctx(dir, session.entries));
+
+		assert.deepEqual(harness.sent, [], "the refused second play sends nothing");
+		assert.match(capturedNotices.join("\n"), /already armed/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
