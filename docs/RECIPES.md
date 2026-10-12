@@ -379,6 +379,48 @@ It costs real tokens, and it says so. Anything finer than "the action changed" �
 the new answer *better*? — is a judgement no diff can make, and this does not
 pretend otherwise.
 
+## Forking
+
+Shadow asks a model the *same* requests and keeps serving the recording. A fork does
+the opposite: it keeps serving the recording while the request still matches, and
+asks the model the moment it does not. That is what a prefix-keyed cache is for — a
+change at turn 7 re-asks turn 7 and after, and turns 1–6 stay free.
+
+```
+/tape fork auth-refactor.tape --model anthropic/claude-sonnet-4-5
+/tape fork auth-refactor.tape --model anthropic/claude-sonnet-4-5 --max-live-tokens 20000
+/model tape/<recorded-model>
+<send a prompt that diverges from the recording, or edit a tool result>
+/tape status
+```
+
+A plain replay falls back to the *next recorded event* on a hash miss, which is what
+keeps a straight replay working with an imperfect hash. A fork switches that fallback
+off (`onMiss: "miss"`), so a miss is reported rather than answered with a stale
+answer, and the live model answers it. Every miss stays visible in `/tape status`.
+
+Two things guard the spend. A miss on the very first request is flagged as a suspected
+hash mismatch, because a genuine fork cannot happen before the run has diverged — that
+one is a bug in the key, not a counterfactual. And the run stops once it has spent
+`--max-live-tokens` (50000 by default), with a message that says how much was spent
+instead of silently continuing.
+
+### What makes the key correct
+
+The prefix hash covers the messages, the model and the thinking level, and nothing
+else. In particular it excludes the fields that name *who wrote* an earlier turn:
+`api`, `model` and `provider`. Those live on the recorded assistant message, but no
+provider ever sees them in a request — and a replayed turn is served through
+pi-tape's synthetic provider, so they read `tape-replay` where the recording says
+`openai-completions`. Including them made every replay of a real run miss on the
+second request; `test/fixtures/real-session.json` is a capture from a real pi run
+that fails if they are ever hashed again.
+
+The limit is structural and worth knowing before you rely on it: pi cannot unregister
+a tool, so when the live branch calls a tool the recording does not cover, the run
+stops there with an explanation instead of running the real tool. A fork is "replay,
+then one live reasoning step". Executing a procedure is `pi-tape run`.
+
 ## The store
 
 ```

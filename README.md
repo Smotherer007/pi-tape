@@ -29,10 +29,15 @@ What that is good for, in one screen:
 - **A failure that happened once can be looked at twice.** Replay serves the recorded
   answers and replaces the recorded tool calls, so nothing leaves the machine, no
   provider is called, the original side effects do not run again, and the cost is zero.
-  Changing one tool result re-asks only the requests after it.
-- **Knowledge multiplies instead of accumulating.** Take k recordings of one task:
-  what they share is the procedure, what varied is a parameter. A framework swap then
-  carries its router with it, because the two varied together.
+- **A branch costs only what is new.** Requests are keyed by prefix, so
+  `/tape fork <file> --model <p>/<m>` serves the recording while the context still
+  matches and asks that model the moment it does not. A miss is logged, never
+  answered silently with the old recording.
+- **Knowledge multiplies instead of accumulating — in principle.** Take k recordings
+  of one task: what they share is the procedure, what varied is a parameter. A
+  framework swap then carries its router with it, because the two varied together.
+  This layer is the youngest part of the project and is not yet backed by a
+  measurement on real sessions; see [Honest limits](#honest-limits).
 - **Composition is checkable, not hoped for.** Every step says what it needs and what
   it leaves behind, so "take part A and part B" has an answer: what is met, and what
   is a gap — with the gap named.
@@ -59,13 +64,17 @@ Self-test
 ```
 ## Why a tape plays back exactly
 
-An LLM call is a pure function of its prefix. Hash the prefix (messages plus tool
-declarations, minus timestamps and usage counters) and you have a cache key. Record
-the answers, then serve them instead of calling a provider.
+An LLM call is a pure function of its prefix. Hash the prefix (messages, model and
+thinking level — and, with `bindToolContext`, the tool declarations; system messages
+are folded into that context rather than hashed as a message) and you have a cache
+key. Record the answers, then serve them instead of calling a provider.
 
-The useful property is **forking**. Because lookups are keyed by prefix, changing
-one tool result at turn 7 invalidates only the requests after it. Everything before
-comes from the cache; only the new branch costs real tokens.
+Keying by prefix is what makes **forking** pay: change one tool result at turn 7 and
+only the requests after it differ. A plain replay (`/tape play`) serves a hash hit from
+the recording and, on a miss, the next unconsumed event — an old answer to a new
+context, which it records as a miss rather than hiding. A fork (`/tape fork … --model`)
+is the same engine with that fallback switched off: a miss is asked of a real model, so
+a new context gets a new answer instead of a stale one. See [Honest limits](#honest-limits).
 
 ## Why recipes compose
 
@@ -286,8 +295,9 @@ armed. The command is for you; the tools are for the agent.
 | `/tape record [name] [--redact]` | write this session to a `.tape` file; `--redact` replaces credentials first |
 | `/tape play <file>` | arm deterministic replay from a recording |
 | `/tape shadow <file> --model <provider>/<model>` | replay, and ask another model the same requests |
+| `/tape fork <file> --model <provider>/<model> [--max-live-tokens N]` | serve the recording, ask that model where the recording ends |
 | `/tape regress` | what the shadow model answered differently |
-| `/tape status` | replay progress, misses, shadow progress |
+| `/tape status` | replay progress, misses, shadow and fork progress |
 | `/tape stop` | disarm (then `/reload` to restore the real tools) |
 | `/tape library` | list the recipe store |
 | `/tape index` | rebuild the recipe graph index |
@@ -322,8 +332,10 @@ follow its recording rather than be told about new knowledge.
   solves.
 - **Replay costs nothing and calls no provider.** Everything is served from the
   recording, tool calls included, so the recorded side effects never run again.
-- **Forking pays only for the new branch.** Answers are keyed by request prefix, so
-  changing one tool result at turn 7 re-asks only the requests after it.
+- **The prefix key is what makes forking cheap.** Answers are keyed by request prefix,
+  so changing one tool result at turn 7 re-asks only the requests after it. `/tape fork`
+  turns that into behaviour: served from the recording while the prefix matches, asked
+  of the model where it does not.
 - **A tape can be handed over.** `--redact` replaces what looks like a credential
   before the file is written, and the recipes derived from it never carried one.
 - **The model-upgrade question gets an answer.** A shadow run serves the recording and
@@ -399,6 +411,11 @@ Specification and design rationale: [docs/RECIPES.md](docs/RECIPES.md).
 2. **Position** — when the hash misses (a fork changed the context, or a compaction
    rewrote it), the next unconsumed event of the right kind is served instead. A
    straight replay therefore still works with imperfect hashes.
+3. **Fork** — `/tape fork` switches that fallback off. Step 1 still applies, but a
+   miss is reported instead of served, and the named model is asked — the one honest
+   answer for a context the recording never contained. A miss on the very first
+   request is called out as a suspected hash mismatch, and the run stops once it has
+   spent `--max-live-tokens` (50000 by default) rather than discovering the bill later.
 
 Every miss is recorded, never silent. `/tape status` and `inspect` show them, which
 is how you find out *why* a replay diverged.
@@ -419,9 +436,10 @@ A debugger that lies is worse than none, so:
 - **Contracts are checked, not proven.** `link` shows that the artifacts line up —
   the file, the image, the dependency. It cannot show the result is correct, and a
   step with no contract is invisible to it.
-- **`run` executes the template, not the original command line.** Redirections and
-  quoting are preserved now, but a shell variable still becomes a slot, and anything
-  the recorder could not express is missing from what runs. The plan shows a gap
+- **`run` quotes the values it binds.** A placeholder standing alone becomes one
+  single-quoted argument, and one already inside quotes is escaped in place, so a value
+  with a space, a `;` or a `"` cannot split the command or start a second one. What the
+  recorder could not express is still missing from what runs, and the plan shows a gap
   rather than an approximation, which is why gaps block a run.
 - **Verification is only as strong as the contracts.** `run` checks files and
   directories. A dependency, an image or a running service needs a registry or a
@@ -439,19 +457,37 @@ A debugger that lies is worse than none, so:
 - **Recipes are not a replacement for scripts.** For a deterministic procedure a
   script is exact, atomic and reviewable. Compile the recipe; do not execute it
   step by step in place of the script it should have become.
+- **The replay half is verified against a real session.** The hash key is checked
+  against a capture from a real pi run — the messages pi sent while replaying it,
+  next to the session file it recorded (`test/fixtures/real-session.json`). That
+  fixture exists because the hand-built tests hid a real defect: an assistant
+  message carries the name of the provider that wrote it (`api`, `model`,
+  `provider`), a provider never sees those fields, and including them made every
+  replay of a real run miss on the second request. They are excluded from the key
+  now, and the fixture fails if they come back.
 - **The regression suite is experimental.** `/tape shadow <file> --model <p>/<m>`
   replays a recording and asks another model the same requests, then
   `/tape regress` reports where they differ structurally. The comparison is tested;
   the provider glue around it is the least proven part of the project. The
   conservative pass also misses a credential written as bare prose, which is why
   `record --redact` is a layer and not a guarantee: read a tape before sharing it.
-- **Not yet implemented:** forking from the UI, image payload replay, rule packs
+- **The recipe layer is experimental.** `splice`, `link`, `segment`, the PageRank and
+  Louvain graph passes and the TF-IDF search are tested against hand-built fixtures,
+  not measured on real sessions. The claims about a cheaper second run and knowledge
+  that "multiplies" rest on that layer, so read them as a design argument with tests
+  rather than a demonstrated saving. The replay half of the project is the solid one.
+- **Forking stops at a tool call the recording does not cover.** `/tape fork` asks the
+  named model the requests the recording lacks, but pi cannot unregister a tool, so when
+  the live branch calls a tool with no recorded result the run stops there instead of
+  running the real tool. A fork is "replay, then one live reasoning step"; running an
+  actual procedure is `pi-tape run`.
+- **Not yet implemented:** forking from the UI, image payload replay, and rule packs
   loaded from the store so a repository can describe its own tools.
 
 ## Development
 
 ```bash
-npm test                    # 146 tests
+npm test                    # the full suite (162 tests at this revision)
 npm run typecheck           # tsc --noEmit, clean
 npm run build               # tsc -p tsconfig.build.json -> dist/ (needed only to publish)
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library
