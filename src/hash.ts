@@ -31,6 +31,14 @@ export function stableStringify(value: unknown): string {
 /**
  * Fields that do not change what the model is asked, and therefore must not
  * change the hash.
+ *
+ * `api`, `model` and `provider` belong here even though they name a real thing:
+ * they record who *wrote* an earlier assistant turn, and a provider never sees
+ * them in the request. Leaving them in made every replay miss, because a replayed
+ * turn is served through pi-tape's synthetic provider (`api: "tape-replay"`,
+ * `provider: "tape"`) while the recording says `openai-completions`. When model
+ * identity *should* be part of the key, `bindModelContext` adds it deliberately
+ * from `contextOf`, which reads these fields off the messages.
  */
 const VOLATILE_MESSAGE_KEYS = new Set([
 	"timestamp",
@@ -47,6 +55,9 @@ const VOLATILE_MESSAGE_KEYS = new Set([
 	"nestedCalls",
 	"toolCallId",
 	"isError",
+	"api",
+	"model",
+	"provider",
 ]);
 
 const VOLATILE_BLOCK_KEYS = new Set([

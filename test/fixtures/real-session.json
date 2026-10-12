@@ -1,0 +1,216 @@
+{
+	"note": "Captured from a real pi run against deepseek-flash: one `read` tool call, then a short text answer. System messages are dropped — the prefix hash ignores them, and the real one carries this machine's whole skill catalogue. `recorded` is what pi's session file stored; `live` is what pi sent while replaying that run through pi-tape's synthetic provider, so its assistant message says api=tape-replay where the recording says openai-completions. That difference used to make every replay miss.",
+	"recorded": [
+		{
+			"type": "message",
+			"id": "da947eba",
+			"parentId": "e50aa98a",
+			"timestamp": "2026-10-12T10:13:28.590Z",
+			"message": {
+				"role": "user",
+				"content": [
+					{
+						"type": "text",
+						"text": "Read probe-input.txt and then tell me what it says in one short sentence."
+					}
+				],
+				"timestamp": 1791800008589
+			}
+		},
+		{
+			"type": "message",
+			"id": "a21ee6e7",
+			"parentId": "da947eba",
+			"timestamp": "2026-10-12T10:13:29.960Z",
+			"message": {
+				"role": "assistant",
+				"content": [
+					{
+						"type": "text",
+						"text": "I'll read that file for you."
+					},
+					{
+						"type": "toolCall",
+						"id": "call_00_ET_Sn3cEgBRcfeii7e5hSUx7937",
+						"name": "read",
+						"arguments": {
+							"path": "probe-input.txt",
+							"offset": null,
+							"limit": null
+						}
+					}
+				],
+				"api": "openai-completions",
+				"provider": "deepseek",
+				"model": "deepseek-flash",
+				"usage": {
+					"input": 1227,
+					"output": 79,
+					"cacheRead": 2944,
+					"cacheWrite": 0,
+					"reasoning": 0,
+					"totalTokens": 4250,
+					"cost": {
+						"input": 0.0003681,
+						"output": 0.0000948,
+						"cacheRead": 0.000017664,
+						"cacheWrite": 0,
+						"total": 0.00048056400000000006
+					}
+				},
+				"stopReason": "toolUse",
+				"timestamp": 1791800008598,
+				"responseId": "a285db59-baeb-4122-b8c5-8fba6a5b2ed8",
+				"rawStopReason": "tool_calls"
+			}
+		},
+		{
+			"type": "message",
+			"id": "bcf39051",
+			"parentId": "a21ee6e7",
+			"timestamp": "2026-10-12T10:13:29.966Z",
+			"message": {
+				"role": "toolResult",
+				"toolCallId": "call_00_ET_Sn3cEgBRcfeii7e5hSUx7937",
+				"toolName": "read",
+				"content": [
+					{
+						"type": "text",
+						"text": "hello probe\n"
+					}
+				],
+				"isError": false,
+				"timestamp": 1791800009966
+			}
+		},
+		{
+			"type": "message",
+			"id": "6b4fa691",
+			"parentId": "bcf39051",
+			"timestamp": "2026-10-12T10:13:31.110Z",
+			"message": {
+				"role": "assistant",
+				"content": [
+					{
+						"type": "thinking",
+						"thinking": "The file says \"hello probe\". One short sentence.",
+						"thinkingSignature": "reasoning_content"
+					},
+					{
+						"type": "text",
+						"text": "The file `probe-input.txt` contains the text \"hello probe\"."
+					}
+				],
+				"api": "openai-completions",
+				"provider": "deepseek",
+				"model": "deepseek-flash",
+				"usage": {
+					"input": 169,
+					"output": 27,
+					"cacheRead": 4096,
+					"cacheWrite": 0,
+					"reasoning": 11,
+					"totalTokens": 4292,
+					"cost": {
+						"input": 0.0000507,
+						"output": 0.0000324,
+						"cacheRead": 0.000024576,
+						"cacheWrite": 0,
+						"total": 0.000107676
+					}
+				},
+				"stopReason": "stop",
+				"timestamp": 1791800009969,
+				"responseId": "7162cd3a-1fae-4edc-99d9-63068ef9c77d",
+				"rawStopReason": "stop"
+			}
+		}
+	],
+	"live": [
+		{
+			"type": "message",
+			"id": "5b376423",
+			"parentId": "5820ac78",
+			"timestamp": "2026-10-12T10:17:32.455Z",
+			"message": {
+				"role": "user",
+				"content": [
+					{
+						"type": "text",
+						"text": "Read probe-input.txt and then tell me what it says in one short sentence."
+					}
+				],
+				"timestamp": 1791800252454
+			}
+		},
+		{
+			"type": "message",
+			"id": "2cf2fca8",
+			"parentId": "5b376423",
+			"timestamp": "2026-10-12T10:17:32.457Z",
+			"message": {
+				"role": "assistant",
+				"content": [
+					{
+						"type": "text",
+						"text": "I'll read that file for you."
+					},
+					{
+						"type": "toolCall",
+						"id": "call_00_ET_Sn3cEgBRcfeii7e5hSUx7937",
+						"name": "read",
+						"arguments": {
+							"path": "probe-input.txt",
+							"offset": null,
+							"limit": null
+						}
+					}
+				],
+				"api": "tape-replay",
+				"provider": "deepseek",
+				"model": "deepseek-flash",
+				"usage": {
+					"input": 1227,
+					"output": 79,
+					"cacheRead": 2944,
+					"cacheWrite": 0,
+					"reasoning": 0,
+					"totalTokens": 4250,
+					"cost": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"total": 0
+					}
+				},
+				"stopReason": "toolUse",
+				"timestamp": 1791800008598,
+				"responseId": "a285db59-baeb-4122-b8c5-8fba6a5b2ed8",
+				"rawStopReason": "tool_calls"
+			}
+		},
+		{
+			"type": "message",
+			"id": "8b6a86b4",
+			"parentId": "2cf2fca8",
+			"timestamp": "2026-10-12T10:17:32.459Z",
+			"message": {
+				"role": "toolResult",
+				"toolCallId": "call_00_ET_Sn3cEgBRcfeii7e5hSUx7937",
+				"toolName": "read",
+				"content": [
+					{
+						"type": "text",
+						"text": "hello probe\n"
+					}
+				],
+				"details": {
+					"tape": "replayed"
+				},
+				"isError": false,
+				"timestamp": 1791800252459
+			}
+		}
+	]
+}
