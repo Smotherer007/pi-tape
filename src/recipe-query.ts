@@ -464,3 +464,27 @@ export function unfilledGaps(recipe: Recipe, steps: string[]): UnfilledGap[] {
 }
 
 export { recipeNodeId, stepNodeId };
+
+/**
+ * The steps only some recordings had, as lines for a person or a model.
+ *
+ * With assignments, placeholders are filled and a step whose condition is met is
+ * marked as applying — `./shipit bump billing — when env=prod ← applies here` — which
+ * is as close to a conditional as a recipe gets without pretending to know more than
+ * its recordings showed.
+ */
+export function optionalStepLines(recipe: Recipe, assignments: Record<string, string> = {}): string[] {
+	return (recipe.optionalSteps ?? []).map((item) => {
+		const filled = item.template.replace(/\{\{(\w+)\}\}/g, (match, name: string) => assignments[name] ?? match);
+		const conditions = Object.entries(item.when);
+		const pattern = conditions.length
+			? `when ${conditions.map(([name, value]) => `${name}=${value}`).join(", ")}`
+			: "no pattern in which runs had it";
+		let verdict = "";
+		if (conditions.length && conditions.every(([name]) => assignments[name] !== undefined)) {
+			verdict = conditions.every(([name, value]) => assignments[name] === value) ? "  ← applies here" : "  (does not apply here)";
+		}
+		const where = item.before === undefined ? "" : `, before step ${item.before + 1}`;
+		return `${filled}   — in ${item.observedIn} of ${item.of} runs${where}, ${pattern}${verdict}`;
+	});
+}

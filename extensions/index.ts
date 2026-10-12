@@ -67,7 +67,7 @@ import { checkFreshness, formatFreshness } from "../src/freshness.ts";
 import { buildRecipeGraph, computeCentrality, detectCommunities, godSteps, recipeCommunities } from "../src/graph.ts";
 import { extractRecipe } from "../src/recipe-extract.ts";
 import { familyOrthogonality, intersectRecipes } from "../src/recipe-intersect.ts";
-import { composeRecipe, unfilledGaps, queryRecipes } from "../src/recipe-query.ts";
+import { composeRecipe, optionalStepLines, rankRecipes, unfilledGaps, queryRecipes } from "../src/recipe-query.ts";
 import { bindRecipe, dangerOf, probeCommands, verifyConditions } from "../src/run.ts";
 import { segmentEvidence, segmentToRecipe, sliceRecipe, parseRange } from "../src/segment.ts";
 import {
@@ -207,9 +207,24 @@ let liveRegistry: LiveRegistry | undefined;
  * off to search the web or re-read files. Bounded, because a context injection
  * that grows without limit is the disease, not the cure.
  */
-export function recipeContext(cwd: string, budgetChars = 1800): string {
+export function recipeContext(cwd: string, budgetChars = 1800, prompt?: string): string {
 	const { recipes } = loadRecipes(cwd);
 	if (!recipes.length) return "";
+
+	// When one recipe clearly matches the task, its procedure goes into the prompt
+	// itself. Listing names and leaving the agent to search, show and plan costs two or
+	// three model requests — measured, that overhead was larger than what the recipe
+	// saved. A procedure in the context costs none.
+	if (prompt) {
+		const best = rankRecipes(
+			recipes.map((item) => item.recipe),
+			prompt,
+		)[0];
+		if (best && best.matchedTerms.length >= 2) {
+			const inline = inlineRecipe(best.recipe);
+			if (inline.length <= budgetChars) return inline;
+		}
+	}
 
 	const lines: string[] = [];
 	lines.push("");
@@ -409,6 +424,9 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 				}
 			}
 
+			const optional = optionalStepLines(recipe);
+			if (optional.length) lines.push("", "seen in some runs only:", ...optional.map((line) => `  ${line}`));
+
 			return textResult(lines.join("\n"), { name: recipe.name, parameters: recipe.parameters.length });
 		},
 	});
@@ -445,6 +463,8 @@ function registerRecipeTools(pi: ExtensionAPI): void {
 				// the agent is the one who has to decide which it is looking at.
 				const gaps = unfilledGaps(recipe, steps);
 				const body = [`${recipe.name} — ${steps.length} step(s)`, "", ...steps.map((step, index) => `${index}. ${step}`)];
+				const optional = optionalStepLines(recipe, params.set ?? {});
+				if (optional.length) body.push("", "seen in some runs only:", ...optional.map((line) => `  ${line}`));
 				if (gaps.length) {
 					body.push("", "still unfilled:");
 					for (const gap of gaps) body.push(`  [${gap.kind}] ${gap.name}: ${gap.hint}`);
@@ -1299,6 +1319,34 @@ function reconnectedPayload(entry: SessionEntry) {
 	};
 }
 
+/** One recipe, written into the prompt as a procedure the agent can follow directly. */
+function inlineRecipe(recipe: Recipe): string {
+	const lines: string[] = [
+		"",
+		`## A recorded procedure matches this task: ${recipe.name}`,
+		"",
+		`Learned from ${recipe.observations} earlier run(s) in this project (outcome: ${recipe.outcome.status}). ` +
+			"Follow it instead of rediscovering the procedure; fill each {{placeholder}} for this task. " +
+			"If a step fails, the recording may be out of date — then fall back to finding out.",
+		"",
+	];
+	recipe.steps.forEach((step, index) => lines.push(`${index + 1}. ${step.template}`));
+	if (recipe.parameters.length) {
+		lines.push("");
+		for (const parameter of recipe.parameters) {
+			lines.push(
+				`{{${parameter.name}}}: ${parameter.enumerated ? "one of" : "e.g."} ${parameter.variants.map((variant) => variant.label).join(", ")}`,
+			);
+		}
+	}
+	const optional = optionalStepLines(recipe);
+	if (optional.length) {
+		lines.push("", "Steps only some runs needed (do them when the condition holds):");
+		for (const line of optional) lines.push(`- ${line}`);
+	}
+	return lines.join("\n");
+}
+
 /**
  * The replaced tools, short enough to read. A real setup declares hundreds — every
  * extension's tools — and the notice is for a person, not an inventory.
@@ -1814,7 +1862,8 @@ export default function (pi: ExtensionAPI) {
 	// recipes are consulted before the agent reaches for the web or the filesystem.
 	pi.on("before_agent_start", (event, ctx) => {
 		if (armed) return;
-		const block = recipeContext(ctx.cwd);
+		const prompt = typeof (event as { prompt?: unknown }).prompt === "string" ? (event as { prompt: string }).prompt : undefined;
+		const block = recipeContext(ctx.cwd, 1800, prompt);
 		if (!block) return;
 		const systemPrompt = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
 		return { systemPrompt: `${systemPrompt}${block}` };

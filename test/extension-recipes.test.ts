@@ -321,3 +321,15 @@ test("the global store directory is created on demand, not on load", () => {
 	tape(pi as never);
 	assert.equal(globalStoreDir(), storeDir);
 });
+
+test("when one recipe matches the task, its procedure is written into the prompt", () => {
+	seedStore(workDir);
+	const text = recipeContext(workDir, 1800, "Set up a new vue frontend with a router and build it");
+	assert.match(text, /A recorded procedure matches this task: frontend-setup/);
+	assert.match(text, /1\. npm create \{\{\w+\}\}/);
+	assert.match(text, /npm run build/);
+	assert.doesNotMatch(text, /tape_search/, "no lookup needed when the procedure is already here");
+
+	const unrelated = recipeContext(workDir, 1800, "Rotate the database credentials");
+	assert.match(unrelated, /Recipe store/, "without a clear match, the store is listed as before");
+});

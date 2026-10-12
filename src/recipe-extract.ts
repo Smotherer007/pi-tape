@@ -15,7 +15,7 @@ import type { Recipe, Step, Slot, StepKind, GapKind } from "./recipe-types.ts";
 import { emptyRecipe } from "./recipe-types.ts";
 import { resolveEntries } from "./tape.ts";
 import { messageOf, toolCallsOf } from "./session.ts";
-import { analyzeCommand, renderTemplate, categorizeFile, shapeAction, tokenizeShell } from "./normalize.ts";
+import { analyzeCommand, renderTemplate, categorizeFile, shapeAction, splitOnOperators, tokenizeShell } from "./normalize.ts";
 import { classifyGapKind, redactText } from "./redact.ts";
 import { contractsOfSteps } from "./contract.ts";
 import type { SessionEntry, TapeFile } from "./types.ts";
@@ -228,12 +228,30 @@ export function extractRecipe(tape: TapeFile, options: ExtractOptions = {}): Ext
 	}
 	let failedCalls = 0;
 
+	// One shell line is often several steps — `./tool login && ./tool deploy api` — and
+	// the same steps run as separate calls in another recording. Split on `&&` and `;`
+	// so both line up; a pipe stays one step, because it is one data flow.
+	const calls: Array<{ name: string; arguments: unknown; id: string }> = [];
 	for (const entry of entries) {
 		for (const call of toolCallsOf(entry)) {
+			// pi-tape's own tools look up and learn recipes; they are how a run used its
+			// memory, not part of the procedure it ran.
+			if (call.name.startsWith("tape_")) continue;
 			if (!options.keepFailedCalls && failedCallIds.has(call.id)) {
 				failedCalls++;
 				continue;
 			}
+			const command = (call.arguments as Record<string, unknown> | undefined)?.command;
+			if (call.name === "bash" && typeof command === "string") {
+				for (const part of splitSequence(command)) calls.push({ ...call, arguments: { ...(call.arguments as object), command: part } });
+			} else {
+				calls.push(call);
+			}
+		}
+	}
+
+	{
+		for (const call of calls) {
 			const args = (call.arguments ?? {}) as Record<string, unknown>;
 			const built = buildStep(call.name, args);
 			if (exclude.has(built.step.verb)) continue;
@@ -311,6 +329,27 @@ export function extractRecipe(tape: TapeFile, options: ExtractOptions = {}): Ext
 	void meaningful;
 
 	return { recipe, sequence, entries, failedCalls };
+}
+
+/**
+ * A shell line split into the commands it runs one after the other.
+ *
+ * `a && b`, `a; b` → `a`, `b`. A pipe or `||` keeps its sides together: `a | b` is one
+ * data flow and `a || b` one decision. Quotes are respected by the tokenizer.
+ */
+export function splitSequence(command: string): string[] {
+	const out: string[] = [];
+	let current: string[] = [];
+	for (const part of splitOnOperators(command)) {
+		if (part === "&&" || part === ";") {
+			if (current.length) out.push(current.join(" ").trim());
+			current = [];
+		} else {
+			current.push(part);
+		}
+	}
+	if (current.length) out.push(current.join(" ").trim());
+	return out.filter(Boolean);
 }
 
 /** Rewrite a template's placeholders to canonical slot names. */

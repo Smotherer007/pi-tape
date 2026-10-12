@@ -21,7 +21,7 @@ import { inspectTape } from "./inspect.ts";
 import { verifyRecording } from "./replay.ts";
 import { extractRecipe } from "./recipe-extract.ts";
 import { familyOrthogonality, intersectRecipes } from "./recipe-intersect.ts";
-import { composeRecipe, missingInputs, unfilledGaps, queryRecipes } from "./recipe-query.ts";
+import { composeRecipe, missingInputs, optionalStepLines, unfilledGaps, queryRecipes } from "./recipe-query.ts";
 import { linkFragments } from "./contract.ts";
 import { describePacks } from "./rules.ts";
 import { executeSteps, formatChecks, planRecipes, verifyConditions } from "./run.ts";
@@ -315,7 +315,11 @@ function cmdSplice(args: Args): void {
 		}
 	}
 
-	if (variants.length) {
+	if (recipe.optionalSteps?.length) {
+		lines.push("");
+		lines.push("seen in some runs only:");
+		for (const line of optionalStepLines(recipe).slice(0, 8)) lines.push(`  ${line}`);
+	} else if (variants.length) {
 		lines.push("");
 		lines.push("not in the skeleton:");
 		for (const variant of variants.slice(0, 8)) {
@@ -409,6 +413,12 @@ function cmdShow(args: Args): void {
 		}
 	}
 
+	if (recipe.optionalSteps?.length) {
+		lines.push("");
+		lines.push("seen in some runs only:");
+		for (const line of optionalStepLines(recipe)) lines.push(`  ${line}`);
+	}
+
 	if (recipe.validators.length) {
 		lines.push("");
 		lines.push("validators:");
@@ -432,6 +442,12 @@ function cmdDub(args: Args): void {
 	}
 
 	for (const step of steps) process.stdout.write(`${step}\n`);
+
+	const optional = optionalStepLines(recipe, assignments);
+	if (optional.length) {
+		process.stderr.write("\nseen in some runs only:\n");
+		for (const line of optional) process.stderr.write(`  ${line}\n`);
+	}
 
 	// A placeholder is not just "something missing": a secret, a path and a project
 	// name each need a different action from whoever (or whatever) fills them.

@@ -125,6 +125,22 @@ export interface Parameter {
 	}>;
 }
 
+export interface OptionalStep {
+	/** The step, with parameter values written as `{{name}}` where they were recognised. */
+	template: string;
+	/** In how many of the recordings it appeared. */
+	observedIn: number;
+	/** Out of how many recordings. */
+	of: number;
+	/**
+	 * Parameter values every recording with this step had, and no recording without it.
+	 * Empty when nothing separates the runs that had it from the runs that did not.
+	 */
+	when: Record<string, string>;
+	/** 0-based skeleton step it came before in the recording, when it came before one. */
+	before?: number;
+}
+
 export interface Validator {
 	/** A shell command that should succeed while the recipe is still valid. */
 	command: string;
@@ -216,6 +232,13 @@ export interface Recipe {
 	slots: Slot[];
 	/** Cross-step parameters, derived from slots that co-vary. */
 	parameters: Parameter[];
+	/**
+	 * Steps that only some recordings had, with the parameter values those recordings
+	 * shared. A recipe has no conditionals; this is how one is carried anyway: `bump`
+	 * appeared only in the run that deployed to prod, so it is kept as "when env=prod"
+	 * instead of being dropped from a skeleton it could not join.
+	 */
+	optionalSteps?: OptionalStep[];
 	compatibility: Compatibility;
 	validators: Validator[];
 	/** What the procedure needs and delivers, for composition. */

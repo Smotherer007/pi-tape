@@ -22,7 +22,7 @@
  *                   what makes "Vue -> React" a value change and not a rewrite.
  */
 
-import type { Parameter, Recipe, Slot, Step, GapKind } from "./recipe-types.ts";
+import type { GapKind, OptionalStep, Parameter, Recipe, Slot, Step } from "./recipe-types.ts";
 import { emptyRecipe } from "./recipe-types.ts";
 import { proposeSlotName, renameTemplate } from "./recipe-extract.ts";
 import { classifyGapKind, mustStayOpen } from "./redact.ts";
@@ -395,17 +395,33 @@ export function intersectRecipes(allRecipes: Recipe[], options: IntersectOptions
 
 	// --- variants ------------------------------------------------------------
 	const variantMap = new Map<string, { key: string; verb: string; inRecordings: number[] }>();
+	const variantStep = new Map<string, { step: Step; recording: number; before?: number }>();
 	prepared.forEach((item, recordingIndex) => {
-		const matched = new Set(
-			lcsAlignment(referenceKeys, item.keys).map(([, otherIndex]) => otherIndex),
-		);
+		// Which of this recording's steps landed in the skeleton, and as which step.
+		const toSkeleton = new Map<number, number>();
+		const pairs: Array<[number, number]> =
+			recordingIndex === reference
+				? referenceKeys.map((_key, index) => [index, index] as [number, number])
+				: lcsAlignment(referenceKeys, item.keys);
+		for (const [refIndex, otherIndex] of pairs) {
+			const skeletonIndex = skeletonRefIndex.indexOf(refIndex);
+			if (skeletonIndex >= 0) toSkeleton.set(otherIndex, skeletonIndex);
+		}
+		const matched =
+			recordingIndex === reference ? new Set(skeletonRefIndex) : new Set(pairs.map(([, otherIndex]) => otherIndex));
 		item.steps.forEach((step, stepIndex) => {
 			if (matched.has(stepIndex)) return;
+			if (step.noise) return;
 			const entry = variantMap.get(step.key) ?? { key: step.key, verb: step.verb, inRecordings: [] };
 			if (!entry.inRecordings.includes(recordingIndex)) entry.inRecordings.push(recordingIndex);
 			variantMap.set(step.key, entry);
+			if (!variantStep.has(step.key)) {
+				const next = [...toSkeleton.entries()].filter(([index]) => index > stepIndex).sort((a, b) => a[0] - b[0])[0];
+				variantStep.set(step.key, { step, recording: recordingIndex, ...(next ? { before: next[1] } : {}) });
+			}
 		});
 	});
+	const optionalSteps = optionalStepsOf([...variantMap.values()], variantStep, slotValueMatrix, k);
 
 	// `longestSteps` counts the meaningful steps, so orthogonality compares like
 	// with like instead of being deflated by reconnaissance.
@@ -417,6 +433,7 @@ export function intersectRecipes(allRecipes: Recipe[], options: IntersectOptions
 	merged.steps = skeleton;
 	merged.slots = slots;
 	merged.parameters = parameters;
+	if (optionalSteps.length) merged.optionalSteps = optionalSteps;
 	merged.orthogonality = longestSteps ? skeleton.length / longestSteps : 0;
 	merged.compatibility.constraints = mergeConstraints(recipes);
 	merged.validators = dedupeValidators(recipes);
@@ -445,6 +462,58 @@ export function intersectRecipes(allRecipes: Recipe[], options: IntersectOptions
 		noiseExcluded: prepared.reduce((sum, item) => sum + item.noise, 0),
 		excludedFailed: failed.map((recipe) => recipe.id),
 	};
+}
+
+/**
+ * Steps only some recordings had, each with what set those recordings apart.
+ *
+ * A condition is a slot whose values in the recordings *with* the step never occur in
+ * the recordings *without* it: `bump` ran only where env was `prod`, and no run without
+ * `bump` had env `prod`. A slot that merely happened to have one value in the runs with
+ * the step (the service was `api`, but `api` also ran without it) is not a condition.
+ */
+function optionalStepsOf(
+	variants: Array<{ key: string; verb: string; inRecordings: number[] }>,
+	steps: Map<string, { step: Step; recording: number; before?: number }>,
+	matrix: Map<string, Map<number, string>>,
+	k: number,
+): OptionalStep[] {
+	const out: OptionalStep[] = [];
+	for (const variant of variants) {
+		const found = steps.get(variant.key);
+		if (!found) continue;
+		const withStep = new Set(variant.inRecordings);
+		const when: Record<string, string> = {};
+		const parameterNames = new Set([...matrix.keys()].map((key) => key.split("#")[1] as string));
+		// Placeholders the extractor made that are not parameters of the family (the
+		// tool's own path, say) are put back to what the recording ran.
+		let template = found.step.template.replace(/\{\{(\w+)\}\}/g, (match, name: string) =>
+			parameterNames.has(name) ? match : (found.step.slotValues[name] ?? match),
+		);
+
+		for (const [key, values] of matrix) {
+			const name = key.split("#")[1] as string;
+			const inside = new Set([...values].filter(([recording]) => withStep.has(recording)).map(([, value]) => value));
+			const outside = new Set([...values].filter(([recording]) => !withStep.has(recording)).map(([, value]) => value));
+			if (inside.size === 1 && outside.size > 0 && ![...inside].some((value) => outside.has(value))) {
+				when[name] = [...inside][0] as string;
+			}
+			// Write the parameter back into the step where its value appears verbatim.
+			const own = values.get(found.recording);
+			if (own && !(name in when)) {
+				const escaped = own.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+				template = template.replace(new RegExp(`(^|\\s)${escaped}(?=\\s|$)`, "g"), `$1{{${name}}}`);
+			}
+		}
+		out.push({
+			template,
+			observedIn: variant.inRecordings.length,
+			of: k,
+			when,
+			...(found.before === undefined ? {} : { before: found.before }),
+		});
+	}
+	return out;
 }
 
 const GENERIC_SLOT_NAMES = new Set(["arg", "arg1", "arg2", "arg3", "arg4", "path", "path2", "path3", "file", "target"]);

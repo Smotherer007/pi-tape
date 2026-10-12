@@ -399,3 +399,47 @@ test("a project's own tool is learned as a family: the arguments that differ bec
 	assert.deepEqual(env.variants.map((variant) => variant.label).sort(), ["prod", "staging"]);
 	assert.ok(!recipe.slots.some((slot) => slot.kind === "path"), "./shipit is part of the project, not a machine path");
 });
+
+test("a shell line is split into the commands it runs one after another", async () => {
+	const { splitSequence } = await import("../src/recipe-extract.ts");
+	assert.deepEqual(splitSequence("./shipit login --token-file t && ./shipit deploy api --env prod"), [
+		"./shipit login --token-file t",
+		"./shipit deploy api --env prod",
+	]);
+	assert.deepEqual(splitSequence("a; b"), ["a", "b"]);
+	assert.deepEqual(splitSequence("cat x | grep y"), ["cat x | grep y"], "a pipe is one data flow");
+	assert.deepEqual(splitSequence('echo "a && b"'), ['echo "a && b"'], "quotes are respected");
+});
+
+test("pi-tape's own tools are how a run used its memory, not part of the procedure", () => {
+	const entries = [systemEntry("s3000", null)];
+	entries.push(assistantToolCall("a3000", "s3000", "tape_search", { query: "deploy" }));
+	entries.push(toolResultEntry("t3000", "a3000", "tape_search", "no recipe"));
+	entries.push(assistantToolCall("a3001", "t3000", "bash", { command: "./shipit login --token-file t && ./shipit deploy api --env staging" }));
+	entries.push(toolResultEntry("t3001", "a3001", "bash", "deployed"));
+	const tape = recordSession(parseSession(sessionText(entries)), { name: "chained" }).tape;
+	const { recipe } = extractRecipe(tape);
+	assert.deepEqual(
+		recipe.steps.map((step) => step.example),
+		["./shipit login --token-file t", "./shipit deploy api --env staging"],
+	);
+});
+
+test("a step only some runs needed is kept, with the condition and the place it applied", () => {
+	const prod = shipitRun("api", "prod");
+	prod.splice(5, 0, ["./shipit bump api", false]);
+	const recipes = [
+		exploringRecording(shipitRun("api", "staging"), "a"),
+		exploringRecording(shipitRun("web", "staging"), "b"),
+		exploringRecording(prod, "c"),
+	].map((tape) => extractRecipe(tape, { scope: "project" }).recipe);
+
+	const { recipe } = intersectRecipes(recipes, { name: "shipit-deploy", scope: "project" });
+	const bump = recipe.optionalSteps?.find((item) => item.template.includes("bump"));
+	assert.ok(bump, "the prod-only step is not dropped");
+	assert.deepEqual(bump.when, { env: "prod" }, "env separates the runs; the service does not (api ran without it too)");
+	assert.equal(bump.before, 2, "it came before the deploy step");
+	assert.match(bump.template, /^\.\/shipit bump \{\{\w+\}\}$/, "the service is written back as the parameter");
+	assert.equal(bump.observedIn, 1);
+	assert.equal(bump.of, 3);
+});
