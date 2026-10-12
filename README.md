@@ -295,7 +295,7 @@ armed. The command is for you; the tools are for the agent.
 | `/tape record [name] [--redact]` | write this session to a `.tape` file; `--redact` replaces credentials first |
 | `/tape play <file>` | arm deterministic replay from a recording |
 | `/tape shadow <file> --model <provider>/<model>` | replay, and ask another model the same requests |
-| `/tape fork <file> --model <provider>/<model> [--max-live-tokens N]` | serve the recording, ask that model where the recording ends |
+| `/tape fork <file> --model <provider>/<model> [--at <turn|id> --result <text|@file>] [--live-tools a,b] [--max-live-tokens N]` | serve the recording, ask that model where the recording ends |
 | `/tape regress` | what the shadow model answered differently |
 | `/tape status` | replay progress, misses, shadow and fork progress |
 | `/tape stop` | disarm (then `/reload` to restore the real tools) |
@@ -413,7 +413,10 @@ Specification and design rationale: [docs/RECIPES.md](docs/RECIPES.md).
    straight replay therefore still works with imperfect hashes.
 3. **Fork** — `/tape fork` switches that fallback off. Step 1 still applies, but a
    miss is reported instead of served, and the named model is asked — the one honest
-   answer for a context the recording never contained. A miss on the very first
+   answer for a context the recording never contained. A live branch that repeats a
+   recorded call gets the recorded result, so the run continues instead of stopping.
+   `--at <turn> --result <text>` replaces one tool result first, which is the actual
+   "what if the tool had said something else" experiment. A miss on the very first
    request is called out as a suspected hash mismatch, and the run stops once it has
    spent `--max-live-tokens` (50000 by default) rather than discovering the bill later.
 
@@ -476,18 +479,19 @@ A debugger that lies is worse than none, so:
   not measured on real sessions. The claims about a cheaper second run and knowledge
   that "multiplies" rest on that layer, so read them as a design argument with tests
   rather than a demonstrated saving. The replay half of the project is the solid one.
-- **Forking stops at a tool call the recording does not cover.** `/tape fork` asks the
-  named model the requests the recording lacks, but pi cannot unregister a tool, so when
-  the live branch calls a tool with no recorded result the run stops there instead of
-  running the real tool. A fork is "replay, then one live reasoning step"; running an
-  actual procedure is `pi-tape run`.
+- **A fork continues only where the calls repeat.** A live branch that asks for the
+  same tool with the same arguments gets the recorded result, so a run continues past
+  its divergence. A call the recording does not contain stops it — pi cannot
+  unregister a tool, so naming it in `--live-tools` is the only way to run the real
+  implementation, and that has to be decided when the fork is armed. Executing a
+  procedure is `pi-tape run`.
 - **Not yet implemented:** forking from the UI, image payload replay, and rule packs
   loaded from the store so a repository can describe its own tools.
 
 ## Development
 
 ```bash
-npm test                    # the full suite (162 tests at this revision)
+npm test                    # the full suite (185 tests at this revision)
 npm run typecheck           # tsc --noEmit, clean
 npm run build               # tsc -p tsconfig.build.json -> dist/ (needed only to publish)
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library
@@ -567,8 +571,8 @@ Add it under Settings → Secrets and variables → Actions. `GITHUB_TOKEN` is p
 automatically.
 
 What ships is small on purpose: `files` is an allowlist, so the tarball holds the
-compiled `dist/`, the sources, the extension, the docs and the licence and nothing
-else — no tests, no workflows, no dev tooling. `dist/` is built by
+compiled `dist/`, the sources, the extension, the docs, the licence and the citation
+file and nothing else — no tests, no workflows, no dev tooling. `dist/` is built by
 `prepublishOnly`, so publishing without compiling is not possible. `pi` is the only thing
 that supplies a dependency at runtime, which means the published package installs
 nothing of its own, even though the dev tree carries semantic-release and its
@@ -579,6 +583,18 @@ transitive dependencies.
 The index design follows [pi-mindplace](https://github.com/Smotherer007/pi-mindplace)
 (MIT) by Patrick Weppelmann. See [docs/ATTRIBUTION.md](docs/ATTRIBUTION.md) for
 exactly what was borrowed and what was not.
+
+## Licence and citation
+
+Apache License 2.0 — see [LICENSE](LICENSE). It is a permissive licence with one
+condition that matters here: attribution is not optional. A redistribution or a
+derivative has to keep the `LICENSE` and [NOTICE](NOTICE) files and state what was
+changed, so the work cannot quietly become somebody else's.
+
+The parts of this project that are ideas rather than code are the parts worth
+arguing with, so if you build on it, please say what you built on. A machine-readable
+[CITATION.cff](CITATION.cff) is in the repository, and GitHub renders a "Cite this
+repository" button from it.
 
 ## Name
 

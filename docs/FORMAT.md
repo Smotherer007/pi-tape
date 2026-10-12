@@ -39,8 +39,27 @@ just as well, so a tape can be inspected and hand-edited with any text tool.
 | `source` | object | yes | Provenance, see below. |
 | `stats` | object | yes | Pre-computed run statistics, see below. |
 | `outcome` | object | no | How the run ended, see below. Absent in tapes recorded before it existed. |
+| `parent` | object | no | Set when this run was replayed from another tape, see below. |
 | `dict` | string[] | yes | String pool. May be empty. |
 | `entries` | TapeEntry[] | yes | The recorded branch, in order. |
+
+### `parent`
+
+Present only on a recording made while a fork was armed. It is what lets `diff` say
+"this is that run with one value changed" instead of reporting a deliberate
+experiment as a regression. It is provenance, not content, so it is not part of the
+`id` — like `created` and `name`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `tapeId` | string | `id` of the recording this run replayed. |
+| `forkPoint` | object? | The tool result that was replaced, absent when the run diverged on its own prompt. |
+| `forkPoint.toolCallId` | string | The call whose result was replaced. |
+| `forkPoint.toolName` | string | Its tool. |
+| `forkPoint.turn` | number | 1-based position among the recording's tool calls. |
+| `forkPoint.replacement` | string | The value that was put in its place. |
+| `liveRequests` | number? | Requests that had to be asked of a provider. |
+| `reconnected` | number? | Live tool calls that repeated a recorded call and were served from the tape. |
 
 ### `source`
 

@@ -399,11 +399,80 @@ keeps a straight replay working with an imperfect hash. A fork switches that fal
 off (`onMiss: "miss"`), so a miss is reported rather than answered with a stale
 answer, and the live model answers it. Every miss stays visible in `/tape status`.
 
-Two things guard the spend. A miss on the very first request is flagged as a suspected
-hash mismatch, because a genuine fork cannot happen before the run has diverged — that
-one is a bug in the key, not a counterfactual. And the run stops once it has spent
-`--max-live-tokens` (50000 by default), with a message that says how much was spent
-instead of silently continuing.
+## Asking "what if the tool had said something else"
+
+A different *prompt* is one way to fork. The more interesting one is a different *tool
+result*: replay the recording up to one tool call, put something else in its place,
+and let a real model continue from there.
+
+```
+/tape fork deploy.tape --model anthropic/claude-sonnet-4-5 \
+  --at 3 --result 'error: registry unreachable'
+/model tape/<recorded-model>
+<send the recorded first prompt>
+```
+
+The turns before the intervention are served from the tape and cost nothing. The
+replaced result changes the next request's prefix, so from that point the model is
+asked for real — which is the point of the experiment, not a side effect of it.
+
+`--at` accepts either a turn number or a tool call id, and the two mean different
+things on purpose: `--at 3` is readable, `--at call_00_ET_…` is exact. `pi-tape inspect
+<file> --timeline` lists both, together with each call's arguments:
+
+```
+Intervention points (`/tape fork … --at <turn|toolCallId> --result …`)
+  turn  1  read       {"path":"probe-input.txt"}   call_00_ET_Sn3cEgBRcfeii7e5hSUx7937
+```
+
+`--result` takes the rest of the line, so a multi-line value is supplied as
+`--result @notes.txt` rather than inline.
+
+### Continuing after the divergence
+
+A live branch usually asks for something the recording already did — the same file,
+again. Matching is on the call itself (tool and normalized arguments, so pi's empty
+optionals do not break it), and such a call is served from the recording. That is what
+lets a fork run past its divergence instead of stopping one thought later.
+
+A call the recording does not contain still stops the run, with an explanation.
+`--live-tools read,grep` is the escape hatch: those tools are left un-overridden, so
+pi's real implementation runs them. It has to be decided when the fork is armed,
+because `registerTool` wins over the built-in and cannot be undone in place.
+
+### Two guards on the spend
+
+A miss on the very first request is flagged as a suspected hash mismatch *when the
+fork is aimed at a later turn* — nothing has diverged yet at that point, so it is a
+bug in the key rather than a counterfactual. Sending a different first prompt on
+purpose is not warned about; it is recorded as "diverged at the first request".
+
+The run stops once it has spent `--max-live-tokens` (50000 by default), with a message
+that says how much was spent instead of silently continuing.
+
+### Comparing the two runs
+
+Recording a session that ran as a fork writes the link back into the tape
+(`parent`), and `diff` reads it:
+
+```
+$ pi-tape diff deploy.tape forked-run.tape
+left  sha256:8349206c3d6e  4 turns  $0.0006
+right sha256:618879570f87  4 turns  $0.0001
+
+right was forked from left, so the divergence below is the experiment, not a regression
+  fork point  read turn 1 (call_00_ET_Sn3cEgBRcfeii7e5hSUx7937)
+  replaced    "PAYLOAD: 42 golden widgets"
+  live        1 request(s) asked of a provider · 0 live call(s) answered from the recording
+
+shared prefix: 2 turns
+first divergence at turn 2 (content)
+
+  left  #2  toolResult: hello probe
+  right #2  toolResult: PAYLOAD: 42 golden widgets
+```
+
+Without that line a fork reads as a regression, which is the opposite of what it is.
 
 ### What makes the key correct
 
