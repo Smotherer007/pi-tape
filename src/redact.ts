@@ -68,7 +68,14 @@ interface SecretRule {
  * one.
  */
 const SECRET_RULES: SecretRule[] = [
-	{ label: "private_key", re: /(?<secret>-----BEGIN [A-Z ]*PRIVATE KEY-----)/d },
+	// The whole block, not just the header: a PEM body is the secret, and matching
+	// only the `BEGIN` line leaves the key material sitting in the tape. The `END`
+	// line is optional so a truncated key still redacts to the end of the string
+	// rather than slipping through unmatched.
+	{
+		label: "private_key",
+		re: /(?<secret>-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$))/d,
+	},
 	// user:password@host — the host stays, the userinfo cannot.
 	{ label: "url_credentials", re: /(?<pre>\b[a-z][a-z0-9+.-]*:\/\/)(?<secret>[^\s/:@]+:[^\s/@]+)(?<post>@)/id },
 	{ label: "bearer_header", re: /(?<pre>\bauthorization\s*:\s*bearer\s+)(?<secret>[A-Za-z0-9._~+/-]{12,}=*)/id },
