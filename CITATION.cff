@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software in academic work, please cite it as below."
+title: "pi-tape: record, replay and fork an agent session"
+abstract: >-
+  pi-tape records a pi agent session to a compact, redactable tape and replays it
+  deterministically: recorded answers are served instead of calling a provider, and
+  recorded tool calls are replaced instead of being run again. Requests are keyed by a
+  prefix hash, which makes a fork possible — serve the recording while the context
+  matches, ask a real model where it does not. A second layer derives checkable
+  procedures from several recordings of the same task.
+authors:
+  - family-names: Weppelmann
+    given-names: Patrick
+    alias: patimweb
+repository-code: "https://github.com/Smotherer007/pi-tape"
+url: "https://github.com/Smotherer007/pi-tape"
+license: Apache-2.0
+keywords:
+  - agent sessions
+  - deterministic replay
+  - record and replay
+  - LLM debugging
+  - programming by demonstration
+  - procedural knowledge
+type: software

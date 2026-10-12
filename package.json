@@ -13,7 +13,7 @@
     "tape"
   ],
   "author": "Patrick Weppelmann",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=22.18.0"
@@ -35,6 +35,8 @@
     "extensions",
     "docs",
     "LICENSE",
+    "NOTICE",
+    "CITATION.cff",
     "README.md"
   ],
   "scripts": {
