@@ -5,7 +5,7 @@ import { diffTapes, entryFingerprint, formatDiff } from "../src/diff.ts";
 import { hashPrefix, stableStringify } from "../src/hash.ts";
 import { inspectTape } from "../src/inspect.ts";
 import { ReplayEngine, contextOf, verifyRecording } from "../src/replay.ts";
-import { parseSession, pathToLeaf, activeLeaf, branchPoints } from "../src/session.ts";
+import { parseSession, pathToLeaf, activeLeaf, branchPoints, messageOf } from "../src/session.ts";
 import { buildDictionary, packTape, resolveEntries, unpackTape, validateTape, TapeFormatError } from "../src/tape.ts";
 import { computeStats } from "../src/stats.ts";
 import { buildFixture, entry, sessionText, systemEntry, userEntry, assistantText, toolResultEntry, assistantToolCall } from "./fixtures.ts";
@@ -249,6 +249,82 @@ test("a fork that changes the prefix misses the hash and falls back to position"
 	if (outcome.kind === "hit") assert.equal(outcome.via, "cursor", "falls back rather than stalling");
 	assert.equal(engine.diagnostics.length, 1);
 	assert.match(engine.diagnostics[0]?.detail ?? "", /hash missed/);
+});
+
+test("fork mode reports a miss instead of answering a new context with the old answer", () => {
+	const session = parseSession(buildFixture().text);
+	const { tape } = recordSession(session, { leafId: session.entries.at(-1)?.id ?? null });
+	const engine = new ReplayEngine(tape, { onMiss: "miss" });
+	const resolved = resolveEntries(tape);
+
+	// The same counterfactual as above: one tool result was edited, so every request
+	// after it describes a context the recording never contained.
+	const prefix = structuredClone(resolved.slice(0, 2));
+	const toolResult = prefix[1] as Record<string, unknown>;
+	(toolResult.message as Record<string, unknown>).content = [{ type: "text", text: "EDITED" }];
+
+	const outcome = engine.nextAssistant(prefix, { model: "test-model", provider: "test-provider" });
+
+	assert.equal(outcome.kind, "miss", "a fork must not be served the next recorded answer");
+	assert.match(engine.diagnostics[0]?.detail ?? "", /fork mode asks the provider/);
+	const status = engine.status();
+	assert.equal(status.assistantConsumed, 0, "a miss consumes nothing, so the caller can still fork");
+	assert.equal(status.finished, false);
+
+	// The recorded prefix is still reachable, so a fork can serve the untouched part.
+	assert.ok(engine.lookupAssistant(resolved.slice(0, 2)));
+	assert.equal(engine.lookupAssistant(prefix), undefined);
+});
+
+test("lookupAssistant finds only an exact prefix and consumes nothing", () => {
+	const session = parseSession(buildFixture().text);
+	const { tape } = recordSession(session, { leafId: session.entries.at(-1)?.id ?? null });
+	const engine = new ReplayEngine(tape);
+	const resolved = resolveEntries(tape);
+
+	const found = engine.lookupAssistant(resolved.slice(0, 2), contextOf(resolved.slice(0, 3)));
+	assert.equal(found?.id, resolved[2]?.id);
+	assert.equal(engine.status().assistantConsumed, 0, "peeking is not consuming");
+	assert.equal(engine.lookupAssistant(resolved.slice(0, 1)), undefined, "one entry short is a different request");
+});
+
+test("progress counts events served, not the highest index touched", () => {
+	const session = parseSession(buildFixture().text);
+	const { tape } = recordSession(session, { leafId: session.entries.at(-1)?.id ?? null });
+	const engine = new ReplayEngine(tape);
+	const resolved = resolveEntries(tape);
+
+	// Serve the *second* assistant turn first. Its prefix contains the first, which
+	// this does not serve — exactly the out-of-order case a fork produces.
+	const assistantIndexes = resolved
+		.map((item, index) => ({ item, index }))
+		.filter(({ item }) => messageOf(item)?.role === "assistant")
+		.map(({ index }) => index);
+	const secondAssistant = assistantIndexes[1];
+	assert.ok(secondAssistant !== undefined, "the fixture has two assistant turns");
+	const outcome = engine.nextAssistant(resolved.slice(0, secondAssistant), contextOf(resolved.slice(0, secondAssistant + 1)));
+	assert.equal(outcome.kind, "hit");
+
+	assert.equal(engine.status().assistantConsumed, 1, "one event was served, whatever its index");
+});
+
+test("tool declarations can be bound into the key, and a tape still replays against itself", () => {
+	const session = parseSession(buildFixture().text);
+	const { tape } = recordSession(session, { leafId: session.entries.at(-1)?.id ?? null });
+	const resolved = resolveEntries(tape);
+
+	const plain = new ReplayEngine(tape);
+	const bound = new ReplayEngine(tape, { bindToolContext: true });
+
+	assert.ok(bound.lookupAssistant(resolved.slice(0, 2)), "the recording's own tools are in the key and still match");
+	assert.equal(verifyRecording(tape, { bindToolContext: true }).ok, true, "still self-consistent");
+
+	// The same messages with a different tool loadout are a different request, and
+	// that only shows once the declarations are part of the key.
+	const stripped = structuredClone(resolved.slice(0, 2));
+	delete ((stripped[0] as Record<string, unknown>).message as Record<string, unknown>).toolsAdded;
+	assert.ok(plain.lookupAssistant(stripped), "without tool binding the loadout is invisible");
+	assert.equal(bound.lookupAssistant(stripped), undefined, "with it, a changed loadout misses");
 });
 
 test("a replay that runs past its recording reports a miss instead of inventing data", () => {

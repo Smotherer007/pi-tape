@@ -13,6 +13,10 @@
  *    normalisation stripped something the provider cared about — fall back to the
  *    next unconsumed recorded event of the right kind. This keeps a straight
  *    replay working even with imperfect hashes.
+ * 3. *Fork*: with `onMiss: "miss"` the cursor is switched off, so a hash miss is
+ *    reported instead of answered from the recording. The caller can then ask a
+ *    real provider for that request — which is the only honest way to serve a
+ *    context the recording never contained. A miss consumes nothing either way.
  *
  * A miss is never silent: misses land in `diagnostics` so a debugging session can
  * explain why a run diverged from its recording.
@@ -59,12 +63,34 @@ export interface ReplayEngineOptions {
 	 * conversation across different models.
 	 */
 	bindModelContext?: boolean;
+	/**
+	 * Include the tool loadout in the hash. Off by default.
+	 *
+	 * A recording keeps its tools on the system message (`toolsAdded`); a live
+	 * request carries them as `context.tools`. Including them makes the key what the
+	 * design says it is — messages plus tool declarations — but it is only sound when
+	 * both sides agree, and a tool whose description differs by a byte turns every
+	 * lookup into a miss. Off unless the loadout is known to be stable.
+	 */
+	bindToolContext?: boolean;
+	/**
+	 * What a prefix-hash miss means.
+	 *
+	 * - `"cursor"` (default): serve the next unconsumed recorded event of the right
+	 *   kind. A straight replay survives an imperfect hash this way.
+	 * - `"miss"`: report the miss and consume nothing, so the caller can ask a real
+	 *   provider. This is the switch that makes a fork a fork: without it a changed
+	 *   context would silently be answered with the old recording.
+	 */
+	onMiss?: "cursor" | "miss";
 }
 
 interface ResolvedOptions {
 	windowMessages: number;
 	includeThinking: boolean;
 	bindModelContext: boolean;
+	bindToolContext: boolean;
+	onMiss: "cursor" | "miss";
 }
 
 export class ReplayEngine {
@@ -77,8 +103,6 @@ export class ReplayEngine {
 	private readonly toolResults: RecordedEvent[] = [];
 	private readonly consumedAssistants = new Set<number>();
 	private readonly consumedTools = new Set<number>();
-	private assistantCursor = 0;
-	private toolCursor = 0;
 
 	constructor(tape: TapeFile, options: ReplayEngineOptions = {}) {
 		this.tape = tape;
@@ -86,6 +110,8 @@ export class ReplayEngine {
 			windowMessages: options.windowMessages ?? 0,
 			includeThinking: options.includeThinking ?? true,
 			bindModelContext: options.bindModelContext ?? false,
+			bindToolContext: options.bindToolContext ?? false,
+			onMiss: options.onMiss ?? "cursor",
 		};
 		this.entries = resolveEntries(tape);
 
@@ -119,17 +145,27 @@ export class ReplayEngine {
 	}
 
 	/**
+	 * The recorded answer for exactly this prefix, or `undefined` if the recording
+	 * has none. Consumes nothing and does not fall back to position, so a caller can
+	 * decide what a miss means before committing to it.
+	 */
+	lookupAssistant(prefixEntries: SessionEntry[], context: HashContext = {}): SessionEntry | undefined {
+		const hash = this.hashOf(prefixEntries, context);
+		return this.assistants.find((item) => item.hash === hash)?.entry;
+	}
+
+	/**
 	 * The recorded answer a request would be served, *without* consuming it.
 	 *
 	 * This exists so a shadow run can compare the recording with what a different
 	 * model says about the same request, while the recording is still served as
 	 * usual: the run has to follow the recorded trajectory, or the later requests
-	 * would stop lining up with it.
+	 * would stop lining up with it. On a miss it reports the next unconsumed event,
+	 * that being what a cursor replay would serve.
 	 */
 	peekAssistant(prefixEntries: SessionEntry[], context: HashContext = {}): SessionEntry | undefined {
-		const hash = this.hashOf(prefixEntries, context);
-		const byHash = this.assistants.find((item) => item.hash === hash);
-		if (byHash) return byHash.entry;
+		const exact = this.lookupAssistant(prefixEntries, context);
+		if (exact) return exact;
 		return this.assistants.find((item) => !this.consumedAssistants.has(item.index))?.entry;
 	}
 
@@ -145,6 +181,11 @@ export class ReplayEngine {
 		if (byHash) {
 			this.markAssistant(byHash.index);
 			return { kind: "hit", via: "hash", entry: byHash.entry };
+		}
+
+		if (this.options.onMiss === "miss") {
+			this.recordMiss("assistant", hash, -1, "hash miss; fork mode asks the provider instead of falling back");
+			return { kind: "miss", reason: "hash miss; fork mode does not fall back to position" };
 		}
 
 		const next = this.assistants.find((item) => !this.consumedAssistants.has(item.index));
@@ -167,6 +208,16 @@ export class ReplayEngine {
 		if (byHash) {
 			this.markTool(byHash.index);
 			return { kind: "hit", via: "hash", entry: byHash.entry };
+		}
+
+		if (this.options.onMiss === "miss") {
+			this.recordMiss(
+				"tool",
+				hash,
+				-1,
+				`hash miss for tool "${toolName}"; fork mode asks the provider instead of falling back`,
+			);
+			return { kind: "miss", reason: `hash miss for tool "${toolName}"; fork mode does not fall back to position` };
 		}
 
 		const next = this.toolResults.find(
@@ -201,18 +252,19 @@ export class ReplayEngine {
 	}
 
 	/** Convenience wrapper: serve an assistant answer for a provider's message list. */
-	nextAssistantFromMessages(messages: unknown[]): ReplayOutcome {
-		return this.nextAssistant(entriesFromMessages(messages), {});
+	nextAssistantFromMessages(messages: unknown[], context: HashContext = {}): ReplayOutcome {
+		return this.nextAssistant(entriesFromMessages(messages), context);
 	}
 
 	status(): ReplayStatus {
 		return {
 			assistantTotal: this.assistants.length,
-			assistantConsumed: this.assistantCursor,
+			assistantConsumed: this.consumedAssistants.size,
 			toolTotal: this.toolResults.length,
-			toolConsumed: this.toolCursor,
+			toolConsumed: this.consumedTools.size,
 			misses: this.diagnostics.length,
-			finished: this.assistantCursor >= this.assistants.length && this.toolCursor >= this.toolResults.length,
+			finished:
+				this.consumedAssistants.size >= this.assistants.length && this.consumedTools.size >= this.toolResults.length,
 		};
 	}
 
@@ -270,7 +322,9 @@ export class ReplayEngine {
 	}
 
 	private hashOf(prefix: SessionEntry[], context: HashContext): string {
-		return hashPrefix(prefix, this.options.bindModelContext ? context : {}, {
+		const resolved: HashContext = this.options.bindModelContext ? { ...context } : {};
+		if (this.options.bindToolContext) resolved.tools = toolsForHash(prefix, context.tools);
+		return hashPrefix(prefix, resolved, {
 			windowMessages: this.options.windowMessages,
 			includeThinking: this.options.includeThinking,
 		});
@@ -278,23 +332,22 @@ export class ReplayEngine {
 
 	private markAssistant(index: number): void {
 		this.consumedAssistants.add(index);
-		this.assistantCursor = Math.max(this.assistantCursor, index + 1);
 	}
 
 	private markTool(index: number): void {
 		this.consumedTools.add(index);
-		this.toolCursor = Math.max(this.toolCursor, index + 1);
 	}
 
-	private recordMiss(kind: "assistant" | "tool", hash: string, index: number): void {
+	private recordMiss(kind: "assistant" | "tool", hash: string, index: number, detail?: string): void {
 		this.diagnostics.push({
 			kind,
 			hash,
-			consumedSoFar: kind === "assistant" ? this.assistantCursor : this.toolCursor,
+			consumedSoFar: kind === "assistant" ? this.consumedAssistants.size : this.consumedTools.size,
 			detail:
-				index < 0
+				detail ??
+				(index < 0
 					? `no recorded ${kind} event matched; the replay left the recording`
-					: `hash missed; served recorded ${kind} #${index} by position instead`,
+					: `hash missed; served recorded ${kind} #${index} by position instead`),
 			timestamp: new Date().toISOString(),
 		});
 	}
@@ -344,6 +397,32 @@ export function contextOf(entries: SessionEntry[]): HashContext {	const context:
 /** Build a replay engine directly from a loaded tape. */
 export function openTape(tape: TapeFile, options: ReplayEngineOptions = {}): ReplayEngine {
 	return new ReplayEngine(tape, options);
+}
+
+/**
+ * The tool loadout to hash, in a stable order.
+ *
+ * Prefers what the prefix itself declares (`toolsAdded` on a system message), so a
+ * recording is self-describing, and falls back to declarations handed in by the
+ * caller. `undefined` when there are none, which leaves the hash of a message list
+ * without tools exactly as it was.
+ */
+function toolsForHash(prefix: SessionEntry[], supplied: unknown): unknown {
+	const declared: Array<Record<string, unknown>> = [];
+	for (const entry of prefix) {
+		const message = messageOf(entry);
+		if (message?.role !== "system") continue;
+		const list = message.toolsAdded;
+		if (!Array.isArray(list)) continue;
+		for (const tool of list as Array<Record<string, unknown>>) {
+			if (!declared.some((item) => item.name === tool.name)) declared.push(tool);
+		}
+	}
+	const tools = declared.length ? declared : Array.isArray(supplied) ? supplied : undefined;
+	if (!tools?.length) return undefined;
+	return [...tools].sort((a, b) =>
+		String((a as { name?: unknown }).name ?? "").localeCompare(String((b as { name?: unknown }).name ?? "")),
+	);
 }
 
 export interface VerifyResult {
