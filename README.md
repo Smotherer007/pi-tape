@@ -1,5 +1,7 @@
 # pi-tape
 
+![A pixel robot holding a data cassette](screenshot.png)
+
 **Record pi agent sessions, play them back deterministically, splice them into composable recipes — and then run and check them.**
 
 An agent run is not reproducible. There is no stack trace, no breakpoint, and a
@@ -62,6 +64,153 @@ Context cost per tool (result characters)
 Self-test
   ✓ tape is complete
 ```
+# pi-tape
+
+**A debugger and experiment bench for pi agent runs: record a run, play it back
+deterministically, fork it at any tool result, and test whether a change to the model
+or to what the agent is told changes what it does.**
+
+An agent run is not reproducible. There is no stack trace, no breakpoint, and a
+failure often happens exactly once. `pi-tape` records what the model and the tools
+actually answered, so a run can be looked at again, changed in one place, and compared
+— without calling a provider for the parts that did not change, and without running
+the original side effects a second time.
+
+What it is for, in the order it has been shown to work:
+
+- **A failure that happened once can be looked at twice.** Replay serves the recorded
+  answers and replaces the recorded tool calls, so nothing leaves the machine, no
+  provider is called, the original side effects do not run again, and the cost is zero.
+  This holds across a compaction, at a different thinking level, and with parallel
+  tool calls — checked against a real pi with a real model (see
+  [What has been shown](#what-has-been-shown)).
+- **"What if the tool had said something else?" has an answer.** `/tape fork … --at
+  <turn> --result <text>` replaces one tool result and lets the model continue live
+  from there. Everything before the intervention comes from the recording, so only the
+  branch costs tokens. That is how a cause is confirmed instead of guessed: in the
+  checked case, a wrong answer was traced to a stale note with one live request.
+- **A change can be tested before it ships.** A model upgrade, or an edit to
+  `AGENTS.md`, a skill or a prompt: `/tape shadow` replays a recorded run and asks the
+  model at every recorded step what it would do *now*. `/tape regress` reports which
+  decisions changed — strict about actions, lenient about wording and about what was
+  merely looked at. Nothing is executed, so a deploy in the recording is not deployed
+  again to find out.
+- **A tape can be handed to someone else.** Credentials are typed as gaps and
+  redacted before the file is written, and a recording states how it ended.
+
+And one layer that is still an experiment:
+
+- **Recipes — procedures distilled from several runs.** k recordings of one task are
+  aligned; what they share becomes the procedure, what varied a parameter, and a step
+  only some runs needed is kept with the condition under which it appeared. The first
+  measurement did not show a saving; see [Recipes: an experiment](#recipes-an-experiment).
+
+```
+╭─ tape "next big thing" sha256:825d832bed7b
+│ format      pi-tape v1 (profile: normal)
+│ size        145.6 KiB on disk · 140 pooled strings · 116 entries
+╰─
+
+Run
+  messages    108 (4 user, 43 assistant, 60 tool results)
+  tokens      3,179,678 (72,970 in / 50,196 out)
+  cost        $0.1005
+
+Context cost per tool (result characters)
+  bash            28 calls  ████████████████████████ 58,357 chars (~14,589 tok)
+
+Self-test
+  ✓ tape is complete
+```
+
+## Where this sits
+
+Two lines of work are close to this one, and the differences are the point.
+
+**Learning procedures from agent runs.** [Voyager](https://arxiv.org/abs/2305.16291)
+(2023) let an agent keep a library of skills as code and reuse them.
+[Agent Workflow Memory](https://arxiv.org/abs/2409.07429) (ICML 2025) induces reusable
+workflows from past trajectories and gives them to later runs, with clear gains on web
+benchmarks. [Agent Skill Induction](https://arxiv.org/abs/2504.06821) (2025) keeps skills
+as programs and admits one only after it has been executed and shown to work. In all
+three, a language model does the abstraction — flexible, and not inspectable. pi-tape's
+recipe layer does it deterministically: alignment over the recorded calls, parameters
+from what varied, conditions from what separated the runs. That is checkable, and it is
+also brittle where a model would simply have understood; four bugs of exactly that kind
+were found by measuring it (see below). The research measures its gains on long tasks
+where exploring is expensive. The experiment here measured a short one, and found what
+that predicts: when a capable model can find the way in four requests, memory has
+nothing to save.
+
+**Replaying and branching agent runs.** Agent frameworks with checkpoints offer
+something similar — replaying a graph from a saved state and forking it with an edited
+state (LangGraph calls it time travel). That works for agents built in that framework
+from the start. pi-tape works on any pi session, after the fact, from pi's own session
+file; it replaces tool results instead of re-running them; and it can change exactly
+one tool result and let the model take it from there.
+
+**What is new here** is less either half than the combination: recorded runs as
+*fixtures* for testing agent knowledge. The research admits a skill after it has been
+executed again; pi-tape can check a change to a skill, a note or a model against every
+recorded run without executing anything, and point at the step where the behaviour
+moved.
+
+## What has been shown
+
+Everything below was run against a real pi (1.x) with a real model (DeepSeek Flash),
+by the scripts in [`bench/`](bench), which drive pi in RPC mode and check results in the
+world — files on disk, a tool's own log — rather than taking the model's word for it.
+Reports land in `.tape/check/` (ignored by git). Re-run them after any change:
+
+| Script | What it checks | Result |
+|---|---|---|
+| `bench/replay-check.mjs` | record, change the files on disk, replay (also at another thinking level), fork with an intervention | 9/9 — with the full personal setup of ~200 tools from other extensions |
+| `bench/prove.mjs` | a longer run with parallel tool calls and a compaction; replay compacting at the same point; fork *after* the compaction with thinking on; a debugging case | 14/14 |
+| `bench/knowledge-regression.mjs` | shadow a recorded run with unchanged, reworded and broken `AGENTS.md` | mechanics shown with a scripted model; real-model run pending |
+| `bench/recipe-experiment.mjs` | recipes vs. the agent's own notes vs. nothing, on unseen tasks | first run: no saving (below); second run pending |
+
+The debugging case, as it ran: an agent read a stale note (`port 3000`) and answered
+`3000`, while the config said `8080`. A fork that replaced only that one read with the
+corrected note answered `8080` — one live request, nothing else re-run — and
+`pi-tape diff` names the fork point and the replaced value.
+
+The checks earned their keep by failing first. Each of these was invisible to the unit
+tests and found only by running real pi: replay missed every request after the first
+because `durationMs` and `thinkingLevel` were part of the key; a fixed live-token budget
+stopped forks after one step in a setup with many tools; a compaction during a replay
+was answered with a recorded tool call and shifted the rest of the run; recipe
+extraction learned the failed attempts of a run and dropped the step that worked.
+
+## Recipes: an experiment
+
+The question is whether a recipe makes the next run cheaper or better than nothing — and
+than the agent's own notes, which cost nothing to build. `bench/recipe-experiment.mjs`
+uses a small in-house deploy tool whose help text is incomplete: three training runs
+are recorded, the agent writes notes after each, pi-tape splices the recordings, and
+three unseen deployments are run under each condition.
+
+First run, DeepSeek Flash, 6 test runs per condition:
+
+| condition | success | requests | tokens | cost |
+|---|---|---|---|---|
+| nothing | 6/6 | 4.5 | 32,900 | $0.0021 |
+| the agent's notes | 6/6 | 4.5 | 38,800 | $0.0031 |
+| recipes | 6/6 | 6.2 | 50,000 | $0.0030 |
+
+No saving, and an overhead. Three reasons, all addressed since: the model simply read
+the tool's source, so exploring cost four requests and there was nothing to save; the
+recipe itself was wrong (pi-tape's own lookup tool had become a step, chained commands
+were not split); and finding a recipe took two or three extra tool calls. Recipes now
+leave pi-tape's own tools out, split `a && b`, keep conditional steps (`bump — before
+step 3, when env=prod`), and a recipe that clearly matches the task is written into the
+prompt instead of being looked up. The notes did not help either: the model checked for
+itself anyway.
+
+The second run adds a *sealed* variant of the tool, whose source cannot be read, so the
+procedure can only be found by trying — the situation the research measures. If recipes
+help anywhere, it is there; if they do not, that is the answer, and this section will
+say so.
+
 ## Why a tape plays back exactly
 
 An LLM call is a pure function of its prefix. Hash the prefix (messages, model and
@@ -76,7 +225,7 @@ context, which it records as a miss rather than hiding. A fork (`/tape fork … 
 is the same engine with that fallback switched off: a miss is asked of a real model, so
 a new context gets a new answer instead of a stale one. See [Honest limits](#honest-limits).
 
-## Why recipes compose
+## Why recipes compose (experimental)
 
 You cannot concatenate two tapes — the second fragment's answers depend on a context
 the first fragment never produced. So composition is **intersection**, not
@@ -95,8 +244,9 @@ pi-tape dub frontend-setup --set template=react@latest --set name=demo
 # npm run build
 ```
 
-One parameter swap, no re-learning. That is the point: knowledge that multiplies
-instead of accumulating. Details in [docs/RECIPES.md](docs/RECIPES.md).
+One parameter swap, no re-learning — that is the idea. Whether it pays off in practice
+is what [Recipes: an experiment](#recipes-an-experiment) measures. Details in
+[docs/RECIPES.md](docs/RECIPES.md).
 
 ## Install
 
@@ -176,14 +326,41 @@ the same requests:
 <send the original first prompt>
 /tape regress
 # auth-refactor: old-model → new-model
-#   14 request(s) · 9 identical · 2 structurally different · 3 only reworded
+#   14 request(s) · 9 identical · 2 structurally different · 3 only reworded or inspected differently
 #   the comparison itself cost 41200 tokens
 ```
 
-The comparison is strict about structure and lenient about wording, because a
-different tool call is a different procedure and a rephrased sentence is not. It
-costs real tokens, and it says so. Experimental: see
-[Honest limits](#honest-limits).
+The comparison is strict about actions and lenient about the rest: a different tool
+call that *does* something is a different procedure; a rephrased sentence, an unset
+optional parameter, or a different way of looking around (`ls -la` against `ls`, one
+`read` more) is not. It costs real tokens, and it says so.
+
+### Test a change to what the agent knows
+
+The same mechanism checks a change to `AGENTS.md`, a skill or a system prompt. Keep a
+recording of a run that worked; after the change, shadow it with the same model. The
+recording fixes the trajectory, the model sees the *new* knowledge, and every recorded
+step is asked again:
+
+```
+# AGENTS.md lost the line "prod only: run ./shipit bump <service> before the deploy"
+/tape shadow golden.tape --model deepseek/deepseek-flash
+/model tape/deepseek-flash
+<the original first prompt>
+/tape regress
+# golden: deepseek-flash → deepseek/deepseek-flash
+#   4 request(s) · 3 identical · 1 structurally different · 0 only reworded or inspected differently
+#   structurally different requests:
+#     turn 2
+#       recorded: bash({"command":"./shipit bump billing"})
+#       new:      bash({"command":"./shipit deploy billing --env prod"})
+```
+
+Nothing is executed — the deploy in the recording is not deployed again — and the
+report names the step where behaviour moved. Run it with the unchanged file first: what
+differs then is the model's own noise, and that is the baseline a real regression has
+to stand out from. `bench/knowledge-regression.mjs` does all of this, including the
+control.
 
 ### Splice tapes into a recipe
 
@@ -484,11 +661,19 @@ A debugger that lies is worse than none, so:
   the provider glue around it is the least proven part of the project. The
   conservative pass also misses a credential written as bare prose, which is why
   `record --redact` is a layer and not a guarantee: read a tape before sharing it.
-- **The recipe layer is experimental.** `splice`, `link`, `segment`, the PageRank and
-  Louvain graph passes and the TF-IDF search are tested against hand-built fixtures,
-  not measured on real sessions. The claims about a cheaper second run and knowledge
-  that "multiplies" rest on that layer, so read them as a design argument with tests
-  rather than a demonstrated saving. The replay half of the project is the solid one.
+- **The recipe layer is experimental.** It has been measured once against real runs,
+  and that run showed no saving (see [Recipes: an experiment](#recipes-an-experiment)).
+  `link`, `segment`, `run`, the PageRank and Louvain graph passes and the TF-IDF search
+  are tested against hand-built fixtures only. The replay, fork and shadow half of the
+  project is the one that has been shown to work.
+- **A recipe has no conditionals.** A step only some runs needed is kept with the
+  parameter values that separated those runs (`when env=prod`) and where it came
+  (`before step 3`). That is a pattern seen in k recordings, not a rule, and with three
+  recordings it can be a coincidence.
+- **The checks in `bench/` ran against one provider.** DeepSeek Flash, with thinking on.
+  Providers that sign their reasoning (Anthropic) are the open case for a fork: the
+  replayed turns are sent back to them. `bench/prove.mjs` checks exactly that when
+  such a model is configured.
 - **A fork reconnects narrowly.** A live branch that repeats a recorded call gets the
   recorded result only for read-only tools, only up to the recording's next change,
   and never after a live tool has changed something — otherwise it would be served an
@@ -509,10 +694,11 @@ A debugger that lies is worse than none, so:
 ## Development
 
 ```bash
-npm test                    # the full suite (202 tests at this revision)
+npm test                    # the full suite (212 tests at this revision)
 npm run typecheck           # tsc --noEmit, clean
 npm run build               # tsc -p tsconfig.build.json -> dist/ (needed only to publish)
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library
+node bench/prove.mjs        # against a real pi and model; reports in .tape/check/
 ```
 
 ```
@@ -541,6 +727,7 @@ src/regress.ts          two answers compared: structure strict, wording lenient
 src/freshness.ts        dependency validators: is this recipe still true
 src/cli.ts              command line interface
 extensions/             the pi extension: record, playback, shadow runs, seven tools
+bench/                  checks against a real pi and model, driven over RPC (not shipped)
 test/                   node:test, no framework
                         cli.test.ts guards the published artefact, not the code
 ```
@@ -589,8 +776,9 @@ Add it under Settings → Secrets and variables → Actions. `GITHUB_TOKEN` is p
 automatically.
 
 What ships is small on purpose: `files` is an allowlist, so the tarball holds the
-compiled `dist/`, the sources, the extension, the docs, the licence and the citation
-file and nothing else — no tests, no workflows, no dev tooling. `dist/` is built by
+compiled `dist/`, the sources, the extension, the docs, the licence, the citation file
+and the screenshot the README shows, and nothing else — no tests, no workflows, no dev
+tooling. `dist/` is built by
 `prepublishOnly`, so publishing without compiling is not possible. `pi` is the only thing
 that supplies a dependency at runtime, which means the published package installs
 nothing of its own, even though the dev tree carries semantic-release and its

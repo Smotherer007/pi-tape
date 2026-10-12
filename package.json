@@ -37,7 +37,8 @@
     "LICENSE",
     "NOTICE",
     "CITATION.cff",
-    "README.md"
+    "README.md",
+    "screenshot.png"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

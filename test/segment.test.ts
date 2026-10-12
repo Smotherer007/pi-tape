@@ -274,7 +274,7 @@ test("the report separates a changed procedure from a changed sentence", () => {
 
 	const text = formatRegression(report);
 	assert.match(text, /old-model → new-model/);
-	assert.match(text, /1 identical · 1 structurally different · 1 only reworded/);
+	assert.match(text, /1 identical · 1 structurally different · 1 only reworded or inspected differently/);
 	assert.match(text, /the comparison itself cost 1200 tokens/);
 	assert.match(text, /structurally different requests:/);
 	assert.match(text, /recorded: npm test/);
@@ -325,4 +325,28 @@ test("redaction leaves a tape without credentials untouched", () => {
 	assert.equal(redacted.lossy, false, "nothing was redacted, so nothing was lost");
 	assert.deepEqual(redacted.dropped, []);
 	assert.ok(tape.outcome);
+});
+
+test("looking around differently is not a different procedure; acting differently is", async () => {
+	const { compareAnswers } = await import("../src/regress.ts");
+	const call = (command: string) => ({ name: "bash", arguments: JSON.stringify({ command }) });
+	const answer = (...commands: string[]) => ({ text: "", toolCalls: commands.map(call), stopReason: "toolUse" });
+
+	const looked = compareAnswers(
+		answer("ls -la; echo ---; ./shipit login --token-file t && ./shipit bump billing"),
+		answer("ls && ./shipit login --token-file t && ./shipit bump billing"),
+	);
+	assert.deepEqual(looked.map((item) => item.kind), ["inspection"]);
+
+	const acted = compareAnswers(
+		answer("./shipit login --token-file t && ./shipit bump billing"),
+		answer("./shipit login --token-file t && ./shipit deploy billing --env prod"),
+	);
+	assert.deepEqual(acted.map((item) => item.kind), ["toolCalls"]);
+
+	const { shapeOf } = await import("../src/regress.ts");
+	const read = (args: Record<string, unknown>) =>
+		shapeOf({ role: "assistant", content: [{ type: "toolCall", id: "x", name: "read", arguments: args }] });
+	const optionals = compareAnswers(read({ path: "a", offset: null, limit: null }), read({ path: "a" }));
+	assert.equal(optionals.length, 0, "an unset optional is not a different call");
 });

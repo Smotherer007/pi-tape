@@ -17,6 +17,9 @@
 import { contentBlocks, messageOf } from "./session.ts";
 import type { SessionEntry } from "./types.ts";
 import { stableStringify } from "./hash.ts";
+import { analyzeCommand, isNoiseCommand } from "./normalize.ts";
+import { splitSequence } from "./recipe-extract.ts";
+import { isReadOnlyTool } from "./replay.ts";
 
 export interface ToolCallShape {
 	name: string;
@@ -32,7 +35,12 @@ export interface AnswerShape {
 	error?: string;
 }
 
-export type DivergenceKind = "text" | "toolCalls" | "stopReason" | "error";
+/**
+ * `inspection`: the calls differ, but only in what was looked at — `ls -la` against
+ * `ls`, a `read` of one file more. A model words its reconnaissance differently every
+ * time; counting that as a different procedure made every comparison noisy.
+ */
+export type DivergenceKind = "text" | "inspection" | "toolCalls" | "stopReason" | "error";
 
 export interface Divergence {
 	kind: DivergenceKind;
@@ -58,7 +66,8 @@ export function shapeOf(source: SessionEntry | Record<string, unknown> | undefin
 		.filter((block) => block.type === "toolCall")
 		.map((block) => ({
 			name: String(block.name ?? ""),
-			arguments: stableStringify((block.arguments ?? {}) as never),
+			// pi records unset optional parameters as null; a model leaves them out.
+			arguments: stableStringify(dropEmpty(block.arguments ?? {}) as never),
 		}));
 
 	const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
@@ -96,7 +105,14 @@ export function compareAnswers(recorded: AnswerShape, live: AnswerShape): Diverg
 
 	const recordedCalls = describeCalls(recorded.toolCalls);
 	const liveCalls = describeCalls(live.toolCalls);
-	if (recordedCalls !== liveCalls) {
+	if (recordedCalls !== liveCalls && effectiveActions(recorded.toolCalls) === effectiveActions(live.toolCalls)) {
+		divergences.push({
+			kind: "inspection",
+			detail: "only what it looked at differs; the actions are the same",
+			recorded: recordedCalls,
+			live: liveCalls,
+		});
+	} else if (recordedCalls !== liveCalls) {
 		divergences.push({
 			kind: "toolCalls",
 			detail:
@@ -131,6 +147,44 @@ export function compareAnswers(recorded: AnswerShape, live: AnswerShape): Diverg
 	return divergences;
 }
 
+/**
+ * The calls that act, in order: read-only tools and reconnaissance commands (`ls`,
+ * `cat`, `echo`…) left out, a shell line split into its commands. Values are kept
+ * verbatim — deploying `billing` instead of `web` is a different action.
+ */
+function effectiveActions(calls: ToolCallShape[]): string {
+	const actions: string[] = [];
+	for (const call of calls) {
+		if (isReadOnlyTool(call.name)) continue;
+		let args: Record<string, unknown> = {};
+		try {
+			args = JSON.parse(call.arguments) as Record<string, unknown>;
+		} catch {}
+		if (call.name === "bash" && typeof args.command === "string") {
+			for (const segment of splitSequence(args.command)) {
+				if (isNoiseCommand(analyzeCommand(segment).key)) continue;
+				actions.push(`bash ${segment.replace(/\s+/g, " ").trim()}`);
+			}
+			continue;
+		}
+		actions.push(`${call.name} ${call.arguments}`);
+	}
+	return actions.join("\n");
+}
+
+function dropEmpty(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(dropEmpty);
+	if (value !== null && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+			if (item === null || item === undefined) continue;
+			out[key] = dropEmpty(item);
+		}
+		return out;
+	}
+	return value;
+}
+
 function excerpt(text: string, limit = 120): string {
 	const collapsed = normalizeText(text);
 	return collapsed.length > limit ? `${collapsed.slice(0, limit)}…` : collapsed || "(empty)";
@@ -157,12 +211,14 @@ export interface RegressionReport {
 	liveTokens: number;
 }
 
+const SURFACE: ReadonlySet<DivergenceKind> = new Set(["text", "inspection"]);
+
 export function summarizeRegression(report: RegressionReport): RegressionReport {
 	report.structuralDivergences = report.samples.filter((sample) =>
-		sample.divergences.some((divergence) => divergence.kind !== "text"),
+		sample.divergences.some((divergence) => !SURFACE.has(divergence.kind)),
 	).length;
 	report.wordingDivergences = report.samples.filter(
-		(sample) => sample.divergences.length > 0 && sample.divergences.every((divergence) => divergence.kind === "text"),
+		(sample) => sample.divergences.length > 0 && sample.divergences.every((divergence) => SURFACE.has(divergence.kind)),
 	).length;
 	report.identical = report.samples.filter((sample) => sample.divergences.length === 0).length;
 	return report;
@@ -180,12 +236,12 @@ export function formatRegression(report: RegressionReport): string {
 	lines.push(`${report.tape}: ${report.recordedModel} → ${report.liveModel}`);
 	lines.push(
 		`  ${report.samples.length} request(s) · ${report.identical} identical · ` +
-			`${report.structuralDivergences} structurally different · ${report.wordingDivergences} only reworded`,
+			`${report.structuralDivergences} structurally different · ${report.wordingDivergences} only reworded or inspected differently`,
 	);
 	if (report.liveTokens > 0) lines.push(`  the comparison itself cost ${report.liveTokens} tokens`);
 
 	const interesting = report.samples.filter((sample) =>
-		sample.divergences.some((divergence) => divergence.kind !== "text"),
+		sample.divergences.some((divergence) => !SURFACE.has(divergence.kind)),
 	);
 	if (interesting.length) {
 		lines.push("");
@@ -194,7 +250,7 @@ export function formatRegression(report: RegressionReport): string {
 			lines.push(`  ${sample.label}`);
 			for (const divergence of sample.divergences) {
 				lines.push(`    [${divergence.kind}] ${divergence.detail}`);
-				if (divergence.kind !== "text") {
+				if (!SURFACE.has(divergence.kind)) {
 					lines.push(`      recorded: ${divergence.recorded}`);
 					lines.push(`      new:      ${divergence.live}`);
 				}
@@ -203,7 +259,7 @@ export function formatRegression(report: RegressionReport): string {
 	}
 
 	const reworded = report.samples.filter(
-		(sample) => sample.divergences.length > 0 && sample.divergences.every((divergence) => divergence.kind === "text"),
+		(sample) => sample.divergences.length > 0 && sample.divergences.every((divergence) => SURFACE.has(divergence.kind)),
 	);
 	if (reworded.length) {
 		lines.push("");
