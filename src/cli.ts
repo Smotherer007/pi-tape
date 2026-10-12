@@ -953,13 +953,21 @@ function cmdVerify(args: Args): void {
 	process.stdout.write(`${basename(path)} (${tape.id.slice(0, 19)})\n`);
 	process.stdout.write(`  assistant events served    ${result.assistantHits}\n`);
 	process.stdout.write(`  tool result events served  ${result.toolHits}\n`);
-	process.stdout.write(`  ${result.ok ? "✓ no gaps: every recorded event is servable" : `✗ ${result.misses.length} gap(s)`}\n`);
+	process.stdout.write(
+		`  ${result.ok ? "✓ self-consistent: every recorded event is servable from the recording" : `✗ ${result.misses.length} gap(s)`}\n`,
+	);
 	for (const miss of result.misses.slice(0, 10)) {
 		process.stdout.write(`    · [${miss.kind}] ${miss.detail} (${miss.hash})\n`);
 	}
 
 	// ``verify`` replays the recording against itself, so it proves internal
 	// consistency, not fidelity to the original run. Say so when it matters.
+	if (result.ok) {
+		process.stdout.write(
+			"\n  note: this walks the tape against itself, so it shows the recording is complete —\n" +
+				"        not that it matches the original run. `diff` compares two recordings.\n",
+		);
+	}
 	if (tape.lossy) {
 		process.stdout.write(`\n  note: this is a LOSSY recording (${tape.profile}). Replay may differ from the original run.\n`);
 		for (const item of tape.dropped.slice(0, 5)) process.stdout.write(`        · ${item}\n`);
