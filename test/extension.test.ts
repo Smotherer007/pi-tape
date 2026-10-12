@@ -483,6 +483,37 @@ test("fork without a usable --model prints usage instead of arming", async () =>
 	}
 });
 
+test("a multi-word --result stays a result and out of the file name", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record multiword", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		capturedNotices = [];
+
+		await handler(
+			"fork multiword.tape --model live/model-x --at 1 --result PAYLOAD: 42 golden widgets",
+			fakeCtx(dir, session.entries),
+		);
+
+		// It armed, so the words were treated as the value and not as a file path.
+		assert.equal(captured.providers.has("tape"), true);
+		assert.match(capturedNotices.join("\n"), /intervention {2}read turn 1 \(call_a0003\) → "PAYLOAD: 42 golden widgets"/);
+
+		const tool = captured.tools.get("read") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+		const result = await tool.execute("call_a0003", { path: "a.txt" });
+		assert.equal(
+			(result.content as Array<Record<string, unknown>>)[0]?.text,
+			"PAYLOAD: 42 golden widgets",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("a fork budget that is not a number is refused, not guessed", async () => {
 	const { captured, dir } = prepare();
 	try {
@@ -501,6 +532,185 @@ test("a fork budget that is not a number is refused, not guessed", async () => {
 	}
 });
 
+test("a divergent first prompt is not treated as a hash mismatch", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record plainfork", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live answer");
+		await handler("fork plainfork.tape --model live/model-x", fakeCtx(dir, session.entries));
+		capturedNotices = [];
+
+		const stream = streamOf(captured)(
+			{ api: "tape-replay", provider: "tape", id: "test-model" },
+			{ messages: [{ role: "user", content: [{ type: "text", text: "a different prompt" }] }] },
+		);
+		for await (const _event of stream) void _event;
+
+		assert.doesNotMatch(
+			capturedNotices.join("\n"),
+			/first request is not in the recording/,
+			"sending a different first prompt is how a fork is meant to start",
+		);
+
+		// It is still visible in the report, just not as an alarm.
+		capturedNotices = [];
+		await handler("status", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /diverged at the first request/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("recording a session that ran as a fork links it to the tape it came from", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record origin", fakeCtx(dir, session.entries));
+		const origin = readTape(join(dir, "origin.tape"));
+
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork origin.tape --model live/model-x --at 1 --result REPLACED", fakeCtx(dir, session.entries));
+		await handler("record forked", fakeCtx(dir, session.entries));
+
+		const forked = readTape(join(dir, "forked.tape"));
+		assert.equal(forked.parent?.tapeId, origin.id, "the fork names the recording it was replayed from");
+		assert.deepEqual(forked.parent?.forkPoint, {
+			toolCallId: "call_a0003",
+			toolName: "read",
+			turn: 1,
+			replacement: "REPLACED",
+		});
+		assert.equal(forked.parent?.liveRequests, 0, "nothing went live in this run");
+
+		// And a recording taken outside a fork stays clean.
+		await handler("stop", fakeCtx(dir, session.entries));
+		await handler("record plain-again", fakeCtx(dir, session.entries));
+		assert.equal(readTape(join(dir, "plain-again.tape")).parent, undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Intervention, reconnect and live tools
+// ---------------------------------------------------------------------------
+
+test("--at and --result replace what a recorded tool call returned", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record intervened", fakeCtx(dir, session.entries));
+
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork intervened.tape --model live/model-x --at 1 --result REPLACED", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /intervention {2}read turn 1 \(call_a0003\)/);
+
+		const tool = captured.tools.get("read") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+		const result = await tool.execute("call_a0003", { path: "a.txt" });
+
+		assert.equal((result.content as Array<Record<string, unknown>>)[0]?.text, "REPLACED");
+		assert.equal((result.details as Record<string, unknown>).tape, "override");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("--at by id works too, and a target that does not exist is refused", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record intervened", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		capturedNotices = [];
+
+		await handler("fork intervened.tape --model live/model-x --at call_nope --result x", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /no recorded tool call matches --at call_nope/);
+		assert.equal(captured.providers.has("tape"), false, "a bad target must not arm a run");
+
+		capturedNotices = [];
+		await handler("fork intervened.tape --model live/model-x --at 1", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /--at needs a --result/);
+		assert.equal(captured.providers.has("tape"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a live branch that repeats a recorded call gets the recorded result", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record reconnected", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork reconnected.tape --model live/model-x", fakeCtx(dir, session.entries));
+
+		const tool = captured.tools.get("read") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+
+		// A new id, the same call: this is what a live branch produces, and without the
+		// reconnect it would stop the run here.
+		const reconnected = await tool.execute("call_from_the_live_branch", { path: "a.txt" });
+		assert.equal((reconnected.content as Array<Record<string, unknown>>)[0]?.text, "alpha");
+		assert.notEqual(reconnected.isError, true);
+
+		// A genuinely different request still stops, and says how to allow it.
+		const other = await tool.execute("call_something_new", { path: "other.txt" });
+		assert.equal(other.isError, true);
+		assert.match(String((other.content as Array<Record<string, unknown>>)[0]?.text), /--live-tools read/);
+
+		capturedNotices = [];
+		await handler("status", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /1 live call\(s\) reconnected/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a plain replay never reconnects, because nothing has diverged", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record plain", fakeCtx(dir, session.entries));
+		await handler("play plain.tape", fakeCtx(dir, session.entries));
+
+		const tool = captured.tools.get("read") as {
+			execute: (id: string, params?: unknown) => Promise<Record<string, unknown>>;
+		};
+		const result = await tool.execute("call_from_nowhere", { path: "a.txt" });
+
+		assert.equal(result.isError, true, "a replay is not allowed to invent a match");
+		assert.match(String((result.content as Array<Record<string, unknown>>)[0]?.text), /no recorded result/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("--live-tools leaves a tool alone so pi runs the real one", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record live", fakeCtx(dir, session.entries));
+		fakeRegistry = fakeLiveModel("live");
+		await handler("fork live.tape --model live/model-x --live-tools read,write", fakeCtx(dir, session.entries));
+
+		assert.equal(captured.tools.has("read"), false, "an un-overridden tool is the real one");
+		assert.match(capturedNotices.join("\n"), /live tools {4}read, write run for real/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("the fork budget is announced, and a spent budget stops the next request", async () => {
 	const { captured, dir } = prepare();
 	try {
@@ -509,7 +719,10 @@ test("the fork budget is announced, and a spent budget stops the next request", 
 		await handler("record budgeted", fakeCtx(dir, session.entries));
 
 		fakeRegistry = fakeLiveModel("live answer");
-		await handler("fork budgeted.tape --model live/model-x --max-live-tokens 0", fakeCtx(dir, session.entries));
+		await handler(
+			"fork budgeted.tape --model live/model-x --at 1 --result REPLACED --max-live-tokens 0",
+			fakeCtx(dir, session.entries),
+		);
 		assert.match(capturedNotices.join("\n"), /budget 0 live tokens/, "the arm notice says what may be spent");
 
 		const stream = streamOf(captured)(
@@ -523,8 +736,8 @@ test("the fork budget is announced, and a spent budget stops the next request", 
 		assert.equal(last.type, "error", "a spent budget is an error, not a silent live call");
 		assert.match(last.error.errorMessage, /live-token budget \(0 of 0 tokens\)/);
 
-		// The same request also misfires the mismatch warning, because the very first
-		// request is not in the recording. Both facts must be visible, not either.
+		// The same request also misfires the mismatch warning, because this fork is aimed
+		// at a later turn and the very first request is not in the recording.
 		assert.match(capturedNotices.join("\n"), /first request is not in the recording/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

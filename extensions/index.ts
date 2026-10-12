@@ -83,7 +83,7 @@ import type { Recipe, RecipeIndex } from "../src/recipe-types.ts";
 import { ReplayEngine } from "../src/replay.ts";
 import { parseSession } from "../src/session.ts";
 import { packTape, readTape, writeTape } from "../src/tape.ts";
-import type { SessionFile, TapeFile } from "../src/types.ts";
+import type { SessionEntry, SessionFile, TapeFile, TapeParent } from "../src/types.ts";
 
 const PROVIDER = "tape";
 const STATUS_KEY = "tape";
@@ -126,8 +126,14 @@ interface Fork {
 	maxLiveTokens: number;
 	liveTokens: number;
 	forks: number;
+	/** Live branches served from the recording because they repeated a recorded call. */
+	reconnected: number;
+	/** Tools left un-overridden, so pi's real implementation runs them. */
+	liveTools: string[];
+	/** The armed intervention, if the fork was pointed at a tool result. */
+	intervention?: { toolCallId: string; turn: number; toolName: string; result: string };
 	/** Set when the very first request missed, which is usually a hash mismatch. */
-	suspectMismatch?: boolean;
+	firstMissed?: boolean;
 }
 
 interface Armed {
@@ -1009,7 +1015,28 @@ function recordCommand(args: string, ctx: ExtensionCommandContext): void {
 
 	const redact = /(^|\s)--redact(\s|$)/.test(args);
 	const name = args.replace(/(^|\s)--redact(\s|$)/, " ").trim() || undefined;
-	const result = recordSession(session, { name, piVersion: piVersion(), redact });
+
+	// Recording a session that ran as a fork makes the fork a tape in its own right.
+	// The link back is what lets `diff` say "this is that run with one value changed"
+	// instead of presenting a deliberate experiment as a regression.
+	const parent: TapeParent | undefined = armed?.fork
+		? {
+				tapeId: armed.tape.id,
+				...(armed.fork.intervention
+					? {
+							forkPoint: {
+								toolCallId: armed.fork.intervention.toolCallId,
+								toolName: armed.fork.intervention.toolName,
+								turn: armed.fork.intervention.turn,
+								replacement: armed.fork.intervention.result,
+							},
+						}
+					: {}),
+				liveRequests: armed.fork.forks,
+				reconnected: armed.fork.reconnected,
+			}
+		: undefined;
+	const result = recordSession(session, { name, piVersion: piVersion(), redact, parent });
 	const out = join(ctx.cwd, `${slugify(result.tape.name ?? result.tape.id.slice(7, 19))}.tape`);
 
 	try {
@@ -1058,12 +1085,18 @@ function parseArmArguments(rest: string): {
 	file: string;
 	target?: { provider: string; modelId: string };
 	maxLiveTokens?: number;
+	at?: string;
+	result?: string;
+	liveTools?: string[];
 	error?: string;
 } {
 	const parts = rest.trim().split(/\s+/).filter(Boolean);
 	const consumed = new Set<number>();
 	let target: { provider: string; modelId: string } | undefined;
 	let maxLiveTokens: number | undefined;
+	let at: string | undefined;
+	let result: string | undefined;
+	const liveTools: string[] = [];
 	let error: string | undefined;
 
 	parts.forEach((part, index) => {
@@ -1093,6 +1126,37 @@ function parseArmArguments(rest: string): {
 			const parsed = Number(budget);
 			if (!Number.isFinite(parsed) || parsed < 0) error = `--max-live-tokens expects a number, got "${budget}"`;
 			else maxLiveTokens = parsed;
+			return;
+		}
+
+		// `--result` takes everything up to the next flag, because an intervention is
+		// usually a sentence. Treating it as one token silently pushed the rest of the
+		// sentence into the tape's file name, which then failed to load.
+		if (part === "--result" || part.startsWith("--result=")) {
+			consumed.add(index);
+			const inline = part.startsWith("--result=") ? part.slice("--result=".length) : undefined;
+			const words = inline === undefined ? [] : [inline];
+			if (inline === undefined) {
+				for (let i = index + 1; i < parts.length; i++) {
+					const next = parts[i] as string;
+					if (next.startsWith("--")) break;
+					words.push(next);
+					consumed.add(i);
+				}
+			}
+			result = words.join(" ");
+			return;
+		}
+
+		const atFlag = flag("--at");
+		if (atFlag !== undefined) {
+			at = atFlag;
+			return;
+		}
+
+		const live = flag("--live-tools");
+		if (live !== undefined) {
+			liveTools.push(...live.split(",").map((item) => item.trim()).filter(Boolean));
 		}
 	});
 
@@ -1100,7 +1164,47 @@ function parseArmArguments(rest: string): {
 		file: parts.filter((_, index) => !consumed.has(index)).join(" "),
 		...(target ? { target } : {}),
 		...(maxLiveTokens === undefined ? {} : { maxLiveTokens }),
+		...(at === undefined ? {} : { at }),
+		...(result === undefined ? {} : { result }),
+		...(liveTools.length ? { liveTools } : {}),
 		...(error === undefined ? {} : { error }),
+	};
+}
+
+/**
+ * Resolve `--at` against the recording's tool calls.
+ *
+ * Both spellings matter and mean different things: `--at 2` is the second tool call,
+ * which a human can read off `pi-tape inspect --timeline`, and `--at call_abc` is one
+ * exact call, which a script can paste.
+ */
+function resolveIntervention(
+	engine: ReplayEngine,
+	at: string,
+): { toolCallId: string; turn: number; toolName: string } | undefined {
+	const points = engine.toolCallPoints();
+	const wanted = at.trim();
+	const asTurn = /^(?:turn-?)?(\d+)$/i.exec(wanted);
+	const point = asTurn
+		? points.find((item) => item.turn === Number(asTurn[1]))
+		: points.find((item) => item.toolCallId === wanted);
+	if (!point) return undefined;
+	return { toolCallId: point.toolCallId, turn: point.turn, toolName: point.toolName };
+}
+
+/** A one-line taste of a value, for a notification. */
+function previewText(value: string, max = 60): string {
+	const flat = value.replace(/\s+/g, " ").trim();
+	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/** A recorded tool result in the shape pi expects from a tool. */
+function toolResultPayload(entry: SessionEntry) {
+	const message = (entry.message ?? {}) as Record<string, unknown>;
+	return {
+		content: (Array.isArray(message.content) ? message.content : []) as never,
+		details: (message.details ?? { tape: "replayed" }) as never,
+		...(message.isError === true ? { isError: true } : {}),
 	};
 }
 
@@ -1109,7 +1213,17 @@ interface PlayModes {
 	/** Ask this model the same requests in the background, while serving the recording. */
 	shadow?: { provider: string; modelId: string };
 	/** Ask this model a request the recording does not contain, instead of the next recorded event. */
-	fork?: { provider: string; modelId: string; maxLiveTokens?: number };
+	fork?: {
+		provider: string;
+		modelId: string;
+		maxLiveTokens?: number;
+		/** Tool call to intervene on, by 1-based turn or by tool call id. */
+		at?: string;
+		/** What that tool call should return instead of the recording. */
+		result?: string;
+		/** Tools to leave un-overridden so pi runs the real implementation. */
+		liveTools?: string[];
+	};
 }
 
 function playCommand(
@@ -1147,7 +1261,35 @@ function playCommand(
 		liveRegistry = ctx.modelRegistry as unknown as LiveRegistry;
 	}
 	if (modes.fork) {
-		active.fork = { ...modes.fork, maxLiveTokens: modes.fork.maxLiveTokens ?? 50_000, liveTokens: 0, forks: 0 };
+		const { provider, modelId: forkModel, maxLiveTokens, at, result, liveTools } = modes.fork;
+		if (at !== undefined && result === undefined) {
+			ctx.ui.notify("tape: --at needs a --result, or there is nothing to put in its place.", "warning");
+			return;
+		}
+		const fork: Fork = {
+			provider,
+			modelId: forkModel,
+			maxLiveTokens: maxLiveTokens ?? 50_000,
+			liveTokens: 0,
+			forks: 0,
+			reconnected: 0,
+			liveTools: [...new Set((liveTools ?? []).map((item) => item.trim()).filter(Boolean))],
+		};
+		if (at !== undefined && result !== undefined) {
+			const point = resolveIntervention(engine, at);
+			if (!point) {
+				ctx.ui.notify(
+					`tape: no recorded tool call matches --at ${at}. \`pi-tape inspect <file> --timeline\` lists them by turn and id.`,
+					"error",
+				);
+				return;
+			}
+			// The replacement is what the next request will contain, so the prefix stops
+			// matching and the model is asked for real — the counterfactual being tested.
+			engine.setToolResultOverride(point.toolCallId, [{ type: "text", text: result }]);
+			fork.intervention = { ...point, result };
+		}
+		active.fork = fork;
 		liveRegistry = ctx.modelRegistry as unknown as LiveRegistry;
 	}
 	armed = active;
@@ -1178,16 +1320,23 @@ function playCommand(
 			if (current.fork && liveRegistry) {
 				const prefix = entriesFromMessages((context as { messages: unknown[] }).messages);
 				if (!current.engine.lookupAssistant(prefix)) {
-					// A miss on the very first request is not a fork, it is a warning sign: the
-					// recording and pi disagree about what was asked, and every later request
-					// would be paid for.
-					if (current.fork.forks === 0 && current.engine.status().assistantConsumed === 0 && !current.fork.suspectMismatch) {
-						current.fork.suspectMismatch = true;
-						ctx.ui.notify(
-							"tape: the first request is not in the recording. That is usually a hash mismatch rather than\n" +
-								"a real divergence, so check /tape status before letting this fork spend tokens.",
-							"warning",
-						);
+					// A first-request miss is only alarming when this fork is aimed at a *later*
+					// turn: then the recorded prefix should have matched and did not. Without an
+					// intervention, sending a different first prompt is the documented way to
+					// fork, so the fact is recorded but not raised as an alarm.
+					if (
+						current.fork.forks === 0 &&
+						current.engine.status().assistantConsumed === 0 &&
+						!current.fork.firstMissed
+					) {
+						current.fork.firstMissed = true;
+						if (current.fork.intervention) {
+							ctx.ui.notify(
+								"tape: the first request is not in the recording, but this fork is aimed at a later turn.\n" +
+									"That is a hash mismatch rather than a divergence — check /tape status before spending tokens.",
+								"warning",
+							);
+						}
 					}
 					return createForkStream(current, liveRegistry, context as { messages: unknown[] }, options, typed);
 				}
@@ -1201,8 +1350,11 @@ function playCommand(
 		},
 	});
 
-	// Override every tool the recording used with a cache-backed stand-in.
+	// Override every tool the recording used with a cache-backed stand-in — except the
+	// ones the fork was told to run for real. A tool cannot be un-overridden later
+	// (`registerTool` wins over the built-in), so `--live-tools` has to decide here.
 	for (const name of engine.toolNames()) {
+		if (active.fork?.liveTools.includes(name)) continue;
 		const declaration = engine.toolDeclaration(name);
 		const parameters =
 			declaration && typeof declaration.parameters === "object" && declaration.parameters !== null
@@ -1215,7 +1367,7 @@ function playCommand(
 			description:
 				typeof declaration?.description === "string" ? declaration.description : `Recorded stand-in for ${name}`,
 			parameters,
-			async execute(toolCallId: string) {
+			async execute(toolCallId: string, params?: unknown) {
 				const current = armed;
 				if (!current) {
 					return {
@@ -1225,23 +1377,33 @@ function playCommand(
 					};
 				}
 
-				const outcome = current.engine.nextToolResultById(toolCallId);
-				if (outcome.kind === "miss") {
-					const text = current.fork
-						? `tape: no recorded result for tool call ${toolCallId}. This fork went live and produced a tool call the recording does not cover — pi-tape cannot run the real tool from inside a replay. Record a fresh tape, or run the procedure with \`pi-tape run\`.`
-						: `tape: ${outcome.reason}`;
-					return {
-						content: [{ type: "text", text }],
-						details: { tape: "miss" },
-						isError: true,
-					};
+				// An armed intervention wins: this is the counterfactual being tested.
+				const replacement = current.engine.toolResultOverride(toolCallId);
+				if (replacement !== undefined) {
+					return { content: replacement as never, details: { tape: "override" } as never };
 				}
 
-				const message = (outcome.entry.message ?? {}) as Record<string, unknown>;
+				const outcome = current.engine.nextToolResultById(toolCallId);
+				if (outcome.kind === "hit") return toolResultPayload(outcome.entry);
+
+				// A live branch that asks for what the recording already did gets the recorded
+				// answer, so the run continues past its divergence instead of stopping one
+				// thought later. Matching is on the call itself, not on the id.
+				if (current.fork) {
+					const reconnected = current.engine.matchRecordedCall(name, params ?? {});
+					if (reconnected.kind === "hit") {
+						current.fork.reconnected += 1;
+						return toolResultPayload(reconnected.entry);
+					}
+				}
+
+				const text = current.fork
+					? `tape: ${outcome.reason}. This fork went live and asked for something the recording does not contain, and pi-tape cannot run the real tool from inside a replay. Keep the real tool with \`--live-tools ${name}\`, record a fresh tape, or run the procedure with \`pi-tape run\`.`
+					: `tape: ${outcome.reason}`;
 				return {
-					content: (Array.isArray(message.content) ? message.content : []) as never,
-					details: (message.details ?? { tape: "replayed" }) as never,
-					...(message.isError === true ? { isError: true } : {}),
+					content: [{ type: "text", text }],
+					details: { tape: "miss" },
+					isError: true,
 				};
 			},
 		});
@@ -1258,8 +1420,15 @@ function playCommand(
 		lines.push(
 			`  fork          a request the recording does not contain goes to ${active.fork.provider}/${active.fork.modelId}`,
 			`                budget ${active.fork.maxLiveTokens} live tokens; the recorded prefix stays free`,
-			"                a live tool call the recording lacks stops the run",
 		);
+		if (active.fork.intervention) {
+			const { turn, toolName, toolCallId, result } = active.fork.intervention;
+			lines.push(`  intervention  ${toolName} turn ${turn} (${toolCallId}) → ${JSON.stringify(previewText(result))}`);
+		}
+		if (active.fork.liveTools.length) {
+			lines.push(`  live tools    ${active.fork.liveTools.join(", ")} run for real, not from the recording`);
+		}
+		lines.push("                a live branch that repeats a recorded call gets the recorded result");
 	}
 	lines.push(
 		"",
@@ -1402,8 +1571,14 @@ function statusCommand(ctx: ExtensionCommandContext): void {
 			armed.fork
 				? `  fork       ${armed.fork.forks} request(s) the recording lacked → ` +
 					`${armed.fork.provider}/${armed.fork.modelId} · ${armed.fork.liveTokens}/${armed.fork.maxLiveTokens} tokens` +
-					(armed.fork.suspectMismatch
-						? "\n  fork       ! the first request missed the recording — treat that as a hash mismatch until proven otherwise"
+					(armed.fork.reconnected ? `\n  fork       ${armed.fork.reconnected} live call(s) reconnected to the recording` : "") +
+					(armed.fork.intervention
+						? `\n  fork       ${armed.fork.intervention.toolName} turn ${armed.fork.intervention.turn} was replaced with ${JSON.stringify(previewText(armed.fork.intervention.result))}`
+						: "") +
+					(armed.fork.firstMissed
+						? armed.fork.intervention
+							? "\n  fork       ! the first request missed the recording — treat that as a hash mismatch until proven otherwise"
+							: "\n  fork       the run diverged at the first request (a different prompt, or a hash mismatch)"
 						: "")
 				: "",
 		]
@@ -1464,21 +1639,47 @@ export default function (pi: ExtensionAPI) {
 					// `--model provider/id` answers a request the recording lacks, so a run
 					// can continue past the recording instead of being served the next
 					// recorded event for a context that is not the one asked about.
-					const { file, target, maxLiveTokens, error } = parseArmArguments(rest);
+					const { file, target, maxLiveTokens, at, result, liveTools, error } = parseArmArguments(rest);
 					if (error) {
 						ctx.ui.notify(`tape: ${error}`, "warning");
 						return;
 					}
 					if (!target) {
 						ctx.ui.notify(
-							"Usage: /tape fork <file.tape> --model <provider>/<model> [--max-live-tokens N]\n" +
-								"Served from the recording while the prefix matches; asked of the model when it does not.\n" +
-								"The token budget defaults to 50000 and stops the run instead of overspending.",
+							"Usage: /tape fork <file.tape> --model <provider>/<model> [options]\n" +
+								"  --max-live-tokens N   token budget (default 50000); the run stops when it is spent\n" +
+								"  --at <turn|toolCallId> --result <text|@file>\n" +
+								"                        answer that tool call differently, then continue with the model\n" +
+								"  --live-tools a,b      run those tools for real instead of serving the recording",
 							"warning",
 						);
 						return;
 					}
-					playCommand(pi, file, ctx, { fork: { ...target, ...(maxLiveTokens === undefined ? {} : { maxLiveTokens }) } });
+					if (at !== undefined && result === undefined) {
+						ctx.ui.notify("tape: --at needs a --result, or there is nothing to put in its place.", "warning");
+						return;
+					}
+
+					// A replacement read from a file is how a long or multi-line intervention is
+					// supplied, because a slash command cannot carry one inline.
+					let replacement = result;
+					if (replacement?.startsWith("@")) {
+						try {
+							replacement = readFileSync(resolve(ctx.cwd, replacement.slice(1)), "utf8");
+						} catch (readError) {
+							ctx.ui.notify(`tape: could not read ${replacement.slice(1)}: ${(readError as Error).message}`, "error");
+							return;
+						}
+					}
+
+					playCommand(pi, file, ctx, {
+						fork: {
+							...target,
+							...(maxLiveTokens === undefined ? {} : { maxLiveTokens }),
+							...(at === undefined || replacement === undefined ? {} : { at, result: replacement }),
+							...(liveTools === undefined ? {} : { liveTools }),
+						},
+					});
 					return;
 				}
 				case "regress": {
@@ -1557,6 +1758,10 @@ export default function (pi: ExtensionAPI) {
 							"                           replay, and ask another model the same requests",
 							"  /tape fork <file> --model <provider>/<model>",
 							"                           serve the recording, ask the model where it ends",
+							"    --at <turn|id> --result <text|@file>",
+							"                           answer one tool call differently, then continue live",
+							"    --live-tools a,b       run those tools for real instead of replaying them",
+							"    --max-live-tokens N    token budget (default 50000)",
 							"  /tape regress            what the shadow model answered differently",,
 							"  /tape status             replay progress, misses, shadow and fork progress",
 							"  /tape stop               disarm (then /reload to restore real tools)",
