@@ -46,9 +46,25 @@ export interface ReplayStatus {
 
 interface RecordedEvent {
 	index: number;
+	/** Hash of the full recorded history before this event. */
 	hash: string;
+	/**
+	 * Hash of what the model actually saw, when a compaction came before this event:
+	 * the summary plus the kept messages. A replay that compacts at the same point
+	 * sends that; one that does not sends the full history. Either is a match.
+	 */
+	altHash?: string;
 	toolName: string;
 	entry: SessionEntry;
+}
+
+/** A compaction in the recording, so a replay can serve its summary instead of asking. */
+export interface RecordedCompaction {
+	summary: string;
+	details?: unknown;
+	/** How many recorded answers came before it — where in the run it happened. */
+	assistantsBefore: number;
+	consumed?: boolean;
 }
 
 /** One tool call in the recording, linked to the result that answers it. */
@@ -115,6 +131,7 @@ export class ReplayEngine {
 	private readonly consumedAssistants = new Set<number>();
 	private readonly consumedTools = new Set<number>();
 	private readonly calls: RecordedToolCall[] = [];
+	private readonly compactions: RecordedCompaction[] = [];
 	private readonly overrides = new Map<string, unknown>();
 
 	constructor(tape: TapeFile, options: ReplayEngineOptions = {}) {
@@ -129,19 +146,39 @@ export class ReplayEngine {
 		this.entries = resolveEntries(tape);
 
 		const prefix: SessionEntry[] = [];
+		// What the model saw after a compaction: the summary, then the kept entries.
+		let effective: SessionEntry[] | undefined;
 		for (const entry of this.entries) {
 			const message = messageOf(entry);
 			if (!message) {
+				if (entry.type === "compaction" && typeof entry.summary === "string") {
+					const base = effective ?? prefix;
+					let kept = base.findIndex((item) => item.id === entry.firstKeptEntryId);
+					let from = base;
+					if (kept < 0) {
+						kept = prefix.findIndex((item) => item.id === entry.firstKeptEntryId);
+						from = prefix;
+					}
+					effective = [compactionSummaryEntry(entry), ...(kept >= 0 ? from.slice(kept) : [])];
+					this.compactions.push({
+						summary: entry.summary,
+						...(entry.details === undefined ? {} : { details: entry.details }),
+						assistantsBefore: this.assistants.length,
+					});
+				}
 				prefix.push(entry);
+				effective?.push(entry);
 				continue;
 			}
 
 			const context = contextOf(prefix.concat(entry));
+			const altHash = effective ? this.hashOf(effective, context) : undefined;
 
 			if (message.role === "assistant") {
 				this.assistants.push({
 					index: this.assistants.length,
 					hash: this.hashOf(prefix, context),
+					...(altHash === undefined ? {} : { altHash }),
 					toolName: "",
 					entry,
 				});
@@ -149,11 +186,13 @@ export class ReplayEngine {
 				this.toolResults.push({
 					index: this.toolResults.length,
 					hash: this.hashOf(prefix, context),
+					...(altHash === undefined ? {} : { altHash }),
 					toolName: typeof message.toolName === "string" ? message.toolName : "",
 					entry,
 				});
 			}
 			prefix.push(entry);
+			effective?.push(entry);
 		}
 
 		// A second pass links each call to the result that answers it. A fork needs this
@@ -294,7 +333,7 @@ export class ReplayEngine {
 	 */
 	lookupAssistant(prefixEntries: SessionEntry[], context: HashContext = {}): SessionEntry | undefined {
 		const hash = this.hashOf(prefixEntries, context);
-		return this.assistants.find((item) => item.hash === hash)?.entry;
+		return this.assistants.find((item) => matches(item, hash))?.entry;
 	}
 
 	/**
@@ -312,6 +351,26 @@ export class ReplayEngine {
 		return this.assistants.find((item) => !this.consumedAssistants.has(item.index))?.entry;
 	}
 
+	/**
+	 * The recorded compaction for this point in the run, consumed — or `undefined` when
+	 * the recording did not compact here.
+	 *
+	 * "Here" is the number of recorded answers served so far: a summary written after
+	 * eight answers describes those eight, and handing it to a run at another point
+	 * would summarise a history that run does not have.
+	 */
+	takeCompaction(assistantsServed: number): RecordedCompaction | undefined {
+		const next = this.compactions.find((item) => !item.consumed);
+		if (!next || next.assistantsBefore !== assistantsServed) return undefined;
+		next.consumed = true;
+		return next;
+	}
+
+	/** Compactions in the recording. */
+	get compactionCount(): number {
+		return this.compactions.length;
+	}
+
 	/** Total recorded assistant events, for progress reporting. */
 	get assistantCount(): number {
 		return this.assistants.length;
@@ -320,7 +379,7 @@ export class ReplayEngine {
 	/** Recorded assistant message whose request prefix matches `prefixEntries`. */
 	nextAssistant(prefixEntries: SessionEntry[], context: HashContext = {}): ReplayOutcome {
 		const hash = this.hashOf(prefixEntries, context);
-		const byHash = this.assistants.find((item) => item.hash === hash && !this.consumedAssistants.has(item.index));
+		const byHash = this.assistants.find((item) => matches(item, hash) && !this.consumedAssistants.has(item.index));
 		if (byHash) {
 			this.markAssistant(byHash.index);
 			return { kind: "hit", via: "hash", entry: byHash.entry };
@@ -346,7 +405,7 @@ export class ReplayEngine {
 	nextToolResult(toolName: string, prefixEntries: SessionEntry[], context: HashContext = {}): ReplayOutcome {
 		const hash = this.hashOf(prefixEntries, context);
 		const byHash = this.toolResults.find(
-			(item) => item.hash === hash && item.toolName === toolName && !this.consumedTools.has(item.index),
+			(item) => matches(item, hash) && item.toolName === toolName && !this.consumedTools.has(item.index),
 		);
 		if (byHash) {
 			this.markTool(byHash.index);
@@ -494,6 +553,21 @@ export class ReplayEngine {
 			timestamp: new Date().toISOString(),
 		});
 	}
+}
+
+function matches(item: RecordedEvent, hash: string): boolean {
+	return item.hash === hash || item.altHash === hash;
+}
+
+/** A recorded compaction as the message the model was given in its place. */
+function compactionSummaryEntry(entry: SessionEntry): SessionEntry {
+	return {
+		type: "message",
+		id: `compaction-${entry.id}`,
+		parentId: null,
+		timestamp: "",
+		message: { role: "compactionSummary", summary: entry.summary, content: [] },
+	} as SessionEntry;
 }
 
 /** The tool call id a recorded tool result answers. */

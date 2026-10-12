@@ -408,9 +408,10 @@ Specification and design rationale: [docs/RECIPES.md](docs/RECIPES.md).
 
 1. **Hash** — recorded events are indexed by prefix hash. A matching request is
    served from the recording.
-2. **Position** — when the hash misses (a fork changed the context, or a compaction
-   rewrote it), the next unconsumed event of the right kind is served instead. A
-   straight replay therefore still works with imperfect hashes.
+2. **Position** — when the hash misses (a fork changed the context, or something in
+   the request differs from the recording), the next unconsumed event of the right
+   kind is served instead. A straight replay therefore still works with imperfect
+   hashes.
 3. **Fork** — `/tape fork` switches that fallback off. Step 1 still applies, but a
    miss is reported instead of served, and the named model is asked — the one honest
    answer for a context the recording never contained. A live branch that repeats a
@@ -432,8 +433,15 @@ A debugger that lies is worse than none, so:
 - **Tool overrides last for the process.** pi cannot unregister a tool, so leaving
   replay needs `/reload`. `/tape stop` makes the overrides refuse to run rather than
   pretend.
-- **Compaction breaks hash matching**, not replay. After a compaction point lookups
-  fall back to position.
+- **Compaction is replayed, not redone.** A request after a recorded compaction is
+  indexed twice — by the full history and by what the model actually saw (the
+  summary plus the kept messages) — so it matches whether or not the replay compacts.
+  When pi compacts during a replay, pi-tape answers with the recorded summary if the
+  recording compacted at that point (after the same number of answers), and skips the
+  compaction otherwise, so no recorded answer is spent on a summary. Past a fork's
+  divergence the branch is its own run, and a live model summarises it. A replay that
+  compacts at a *different* point than the recording sends a context the recording
+  never saw, and falls back to position (or, in a fork, stops before the intervention).
 - **Replayed answers report zero cost.** Token counts are kept so the shape of the
   run is visible; the money is zeroed so session totals stay honest.
 - **Recipe extraction is heuristic.** A shell command is a string, not an AST. Step
@@ -501,7 +509,7 @@ A debugger that lies is worse than none, so:
 ## Development
 
 ```bash
-npm test                    # the full suite (196 tests at this revision)
+npm test                    # the full suite (202 tests at this revision)
 npm run typecheck           # tsc --noEmit, clean
 npm run build               # tsc -p tsconfig.build.json -> dist/ (needed only to publish)
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library

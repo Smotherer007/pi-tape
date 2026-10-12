@@ -125,10 +125,41 @@ function normalizeValue(value: unknown): unknown {
 }
 
 /**
+ * How pi hands a compaction summary to the model: a user message that starts with this
+ * sentence and carries the summary between `<summary>` tags. The wording is pi's, not
+ * an API, so it is matched loosely — the sentence and the tags, not the whitespace.
+ */
+const COMPACTION_PREFIX = "The conversation history before this point was compacted into the following summary:";
+
+/**
+ * The compaction summary a message stands for, or `undefined` when it is not one.
+ *
+ * A recording keeps a compaction as an entry (`{type: "compaction", summary}`), and the
+ * replay engine turns it into `{role: "compactionSummary", summary}`; a live request
+ * carries the same summary wrapped in a user message. Both reduce to the summary text,
+ * so a request after a compaction hashes the same on both sides.
+ */
+export function compactionSummaryOf(message: SessionMessage): string | undefined {
+	if (message.role === "compactionSummary" && typeof message.summary === "string") return message.summary;
+	if (message.role !== "user") return undefined;
+	const text = contentBlocks(message)
+		.map((block) => (typeof block.text === "string" ? block.text : ""))
+		.join("");
+	if (!text.startsWith(COMPACTION_PREFIX)) return undefined;
+	const open = text.indexOf("<summary>");
+	const close = text.lastIndexOf("</summary>");
+	if (open < 0 || close < open) return undefined;
+	return text.slice(open + "<summary>".length, close).trim();
+}
+
+/**
  * Reduce a message to the fields that influence the model's answer.
  * Unknown keys are kept, because a provider sees them too.
  */
 export function normalizeMessage(message: SessionMessage, opts: Required<HashOptions>): unknown {
+	const summary = compactionSummaryOf(message);
+	if (summary !== undefined) return { role: "compactionSummary", summary: summary.trim() };
+
 	const out: Record<string, unknown> = { role: message.role };
 
 	for (const key of Object.keys(message).sort()) {

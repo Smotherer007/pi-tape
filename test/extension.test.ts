@@ -16,7 +16,7 @@ import tape from "../extensions/index.ts";
 import { recordSession } from "../src/record.ts";
 import { parseSession, pathToLeaf } from "../src/session.ts";
 import { readTape } from "../src/tape.ts";
-import { buildFixture } from "./fixtures.ts";
+import { buildFixture, compactedSession } from "./fixtures.ts";
 
 interface Captured {
 	commands: Map<string, (args: string, ctx: unknown) => Promise<void> | void>;
@@ -25,6 +25,7 @@ interface Captured {
 	statuses: Array<[string, string | undefined]>;
 	notices: string[];
 	unregistered: string[];
+	handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
 }
 
 function fakePi() {
@@ -35,6 +36,7 @@ function fakePi() {
 		statuses: [],
 		notices: [],
 		unregistered: [],
+		handlers: new Map(),
 	};
 
 	const pi = {
@@ -51,7 +53,8 @@ function fakePi() {
 			captured.unregistered.push(name);
 			captured.providers.delete(name);
 		},
-		on() {
+		on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+			captured.handlers.set(name, handler);
 			return () => {};
 		},
 		registerEntryRenderer() {},
@@ -941,4 +944,70 @@ test("a live read the recording can answer comes from the recording, not today's
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+// ---------------------------------------------------------------------------
+// Compaction during a replay
+// ---------------------------------------------------------------------------
+
+test("a compaction during a replay is answered with the recorded summary", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const { text, entries } = compactedSession();
+		const session = parseSession(text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record compacted", fakeCtx(dir, session.entries));
+		await handler("play compacted.tape", fakeCtx(dir, session.entries));
+
+		// Serve the two answers the recording gave before it compacted.
+		const message = (id: string) => (entries.find((item) => item.id === id) as Record<string, unknown>).message;
+		for (const prefix of [["u1"], ["u1", "a1", "t1"]]) {
+			const stream = streamOf(captured)(
+				{ api: "tape-replay", provider: "tape", id: "test-model" },
+				{ messages: prefix.map(message) },
+			);
+			for await (const _event of stream) void _event;
+		}
+
+		const compact = captured.handlers.get("session_before_compact") as (event: unknown, ctx: unknown) => unknown;
+		const result = (await compact(
+			{ preparation: { firstKeptEntryId: "live-a2", tokensBefore: 99 } },
+			fakeCtx(dir, session.entries),
+		)) as { compaction?: { summary: string; firstKeptEntryId: string; tokensBefore: number } };
+
+		assert.equal(result.compaction?.summary, "The user had a.txt read; it says alpha.");
+		assert.equal(result.compaction?.firstKeptEntryId, "live-a2", "the live session's ids, not the recording's");
+		assert.equal(result.compaction?.tokensBefore, 99);
+
+		capturedNotices = [];
+		await handler("status", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /compaction 1 served from the recording/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a compaction the recording did not make at that point is skipped, not answered", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(compactedSession().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record early", fakeCtx(dir, session.entries));
+		await handler("play early.tape", fakeCtx(dir, session.entries));
+		capturedNotices = [];
+
+		const compact = captured.handlers.get("session_before_compact") as (event: unknown, ctx: unknown) => unknown;
+		const result = (await compact({ preparation: {} }, fakeCtx(dir, session.entries))) as { cancel?: boolean };
+
+		assert.equal(result.cancel, true, "no recorded answer is spent on a summary");
+		assert.match(capturedNotices.join("\n"), /compacted at a different point/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("outside a replay, compaction is none of pi-tape's business", async () => {
+	const { captured } = prepare();
+	const compact = captured.handlers.get("session_before_compact") as (event: unknown, ctx: unknown) => unknown;
+	assert.equal(await compact({ preparation: {} }, {}), undefined);
 });

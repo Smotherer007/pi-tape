@@ -178,6 +178,10 @@ interface Armed {
 	registeredTools: string[];
 	shadow?: Shadow;
 	fork?: Fork;
+	/** Recorded compaction summaries served instead of asking a model to write one. */
+	compactionsServed?: number;
+	/** Compactions refused because the recording has none at that point. */
+	compactionsRefused?: number;
 }
 
 /** Module state: undefined means capture/live mode. */
@@ -1749,6 +1753,10 @@ function statusCommand(ctx: ExtensionCommandContext): void {
 			`  assistant  ${status.assistantConsumed}/${status.assistantTotal} served`,
 			`  tools      ${status.toolConsumed}/${status.toolTotal} served`,
 			`  misses     ${misses.length}`,
+			armed.compactionsServed || armed.compactionsRefused
+				? `  compaction ${armed.compactionsServed ?? 0} served from the recording` +
+					(armed.compactionsRefused ? ` · ${armed.compactionsRefused} skipped (none recorded at that point)` : "")
+				: "",
 			...misses.slice(-3).map((miss) => `    · [${miss.kind}] ${miss.detail}`),
 			`  recorded   $${armed.tape.stats.costUsd.toFixed(4)} ${armed.fork ? "(plus the fork's live tokens)" : "(this replay cost $0)"}`,
 			armed.shadow
@@ -1792,6 +1800,45 @@ export default function (pi: ExtensionAPI) {
 		if (!block) return;
 		const systemPrompt = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
 		return { systemPrompt: `${systemPrompt}${block}` };
+	});
+
+	// A compaction during a replay asks the current model — the tape — for a summary.
+	// Left alone, that request would be answered with the next recorded event (a tool
+	// call, usually), pi would reject it, and the replay would be one answer short from
+	// then on. So while armed, pi-tape answers it: with the recorded summary when the
+	// recording compacted at this point, and by refusing the compaction otherwise —
+	// except past a fork's divergence, where the branch is its own run and a live model
+	// summarises it like any other session.
+	pi.on("session_before_compact", (event, ctx) => {
+		const current = armed;
+		if (!current) return undefined;
+		const fork = current.fork;
+		const diverged = fork !== undefined && (fork.forks > 0 || fork.interventionServed === true);
+		if (diverged) return undefined;
+
+		const served = current.engine.status().assistantConsumed;
+		const recorded = current.engine.takeCompaction(served);
+		if (recorded) {
+			current.compactionsServed = (current.compactionsServed ?? 0) + 1;
+			const preparation = (event as { preparation?: { firstKeptEntryId?: string; tokensBefore?: number } }).preparation;
+			return {
+				compaction: {
+					summary: recorded.summary,
+					firstKeptEntryId: preparation?.firstKeptEntryId,
+					tokensBefore: preparation?.tokensBefore,
+					details: recorded.details ?? { tape: "replayed" },
+				},
+			} as never;
+		}
+
+		current.compactionsRefused = (current.compactionsRefused ?? 0) + 1;
+		ctx.ui.notify(
+			current.engine.compactionCount
+				? `tape: the recording compacted at a different point, not after ${served} answer(s) — this compaction is skipped so the replay stays aligned.`
+				: "tape: the recording has no compaction here — this one is skipped, so a recorded answer is not spent on a summary.",
+			"warning",
+		);
+		return { cancel: true } as never;
 	});
 
 	pi.registerCommand("tape", {

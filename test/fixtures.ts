@@ -175,6 +175,46 @@ export interface Fixture {
 	};
 }
 
+/**
+ * A run with a compaction in the middle: read a file, answer, compact (keeping the
+ * answer), then a second prompt and its answer.
+ */
+export function compactedSession(): { text: string; entries: SessionEntry[] } {
+	const entries: SessionEntry[] = [
+		systemEntry("s1", null),
+		userEntry("u1", "s1", "read a.txt"),
+		assistantToolCall("a1", "u1", "read", { path: "a.txt" }),
+		toolResultEntry("t1", "a1", "read", "alpha"),
+		assistantText("a2", "t1", "it says alpha"),
+		entry({
+			type: "compaction",
+			id: "c1",
+			parentId: "a2",
+			summary: "The user had a.txt read; it says alpha.",
+			firstKeptEntryId: "a2",
+			tokensBefore: 120,
+			details: { readFiles: ["a.txt"], modifiedFiles: [] },
+		}),
+		userEntry("u2", "c1", "and now?"),
+		assistantText("a3", "u2", "still alpha"),
+	];
+	return { text: sessionText(entries), entries };
+}
+
+/** The user message pi sends in place of a compaction, wrapping its summary. */
+export function compactionMessage(summary: string): Record<string, unknown> {
+	return {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `The conversation history before this point was compacted into the following summary:\n\n<summary>\n${summary}\n</summary>`,
+			},
+		],
+		timestamp: 9,
+	};
+}
+
 /** A small branching session used across the tests. */
 export function buildFixture(): Fixture {
 	resetIds();

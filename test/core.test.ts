@@ -8,7 +8,9 @@ import { ReplayEngine, contextOf, verifyRecording } from "../src/replay.ts";
 import { parseSession, pathToLeaf, activeLeaf, branchPoints, messageOf } from "../src/session.ts";
 import { buildDictionary, packTape, resolveEntries, unpackTape, validateTape, TapeFormatError } from "../src/tape.ts";
 import { computeStats } from "../src/stats.ts";
-import { buildFixture, entry, sessionText, systemEntry, userEntry, assistantText, toolResultEntry, assistantToolCall } from "./fixtures.ts";
+import { buildFixture, entry, sessionText, systemEntry, userEntry, assistantText, toolResultEntry, assistantToolCall, compactedSession, compactionMessage } from "./fixtures.ts";
+import { compactionSummaryOf } from "../src/hash.ts";
+import { entriesFromMessages } from "../src/replay.ts";
 
 // ---------------------------------------------------------------------------
 // session parsing and tree navigation
@@ -643,4 +645,53 @@ test("inspect renders a report with run stats and a self-test", () => {
 	assert.match(text, /Self-test/);
 	assert.match(text, /Timeline/);
 	assert.match(text, /tape is complete/);
+});
+
+// ---------------------------------------------------------------------------
+// compaction
+// ---------------------------------------------------------------------------
+
+const messagesOf = (entries: ReturnType<typeof compactedSession>["entries"], ids: string[]) =>
+	ids.map((id) => (entries.find((item) => item.id === id) as Record<string, unknown>).message);
+
+test("a request after a compaction matches whether or not the replay compacted", () => {
+	const { text, entries } = compactedSession();
+	const engine = new ReplayEngine(recordSession(parseSession(text)).tape);
+
+	// Without compacting, a replay sends the whole history.
+	const full = engine.lookupAssistant(entriesFromMessages(messagesOf(entries, ["u1", "a1", "t1", "a2", "u2"])));
+	assert.equal(full?.id, "a3");
+
+	// Compacting at the same point, it sends what the model saw: the summary, then the kept answer.
+	const compacted = engine.lookupAssistant(
+		entriesFromMessages([
+			compactionMessage("The user had a.txt read; it says alpha."),
+			...messagesOf(entries, ["a2", "u2"]),
+		]),
+	);
+	assert.equal(compacted?.id, "a3", "the summary stands in for what it replaced");
+
+	// A different summary is a different request.
+	const other = engine.lookupAssistant(
+		entriesFromMessages([compactionMessage("Something else entirely."), ...messagesOf(entries, ["a2", "u2"])]),
+	);
+	assert.equal(other, undefined);
+});
+
+test("a recorded compaction is served only at the point it happened", () => {
+	const { text } = compactedSession();
+	const engine = new ReplayEngine(recordSession(parseSession(text)).tape);
+	assert.equal(engine.compactionCount, 1);
+	assert.equal(engine.takeCompaction(1), undefined, "after one answer the recording had not compacted yet");
+	const served = engine.takeCompaction(2);
+	assert.equal(served?.summary, "The user had a.txt read; it says alpha.");
+	assert.deepEqual(served?.details, { readFiles: ["a.txt"], modifiedFiles: [] });
+	assert.equal(engine.takeCompaction(2), undefined, "and only once");
+});
+
+test("pi's compaction message is read back to its summary, and nothing else is", () => {
+	assert.equal(compactionSummaryOf(compactionMessage("SUM") as never), "SUM");
+	assert.equal(compactionSummaryOf({ role: "user", content: [{ type: "text", text: "<summary>x</summary>" }] } as never), undefined);
+	assert.equal(compactionSummaryOf({ role: "compactionSummary", summary: "S" } as never), "S");
+	assert.equal(compactionSummaryOf({ role: "assistant", content: [] } as never), undefined);
 });
