@@ -388,7 +388,7 @@ change at turn 7 re-asks turn 7 and after, and turns 1–6 stay free.
 
 ```
 /tape fork auth-refactor.tape --model anthropic/claude-sonnet-4-5
-/tape fork auth-refactor.tape --model anthropic/claude-sonnet-4-5 --max-live-tokens 20000
+/tape fork auth-refactor.tape --model anthropic/claude-sonnet-4-5
 /model tape/<recorded-model>
 <send a prompt that diverges from the recording, or edit a tool result>
 /tape status
@@ -456,10 +456,12 @@ A reconnected result carries `details.tape: "reconnected"` and the recorded call
 `details.from`, so a tape recorded from the fork shows which answers it borrowed.
 
 A call none of that covers stops the run, with an explanation. `--live-tools read,grep`
-runs those tools for real — but only for the branch's own calls: a live tool is still
-overridden, its recorded calls are still served from the tape, and only a call the
-recording does not contain reaches pi's real implementation. Without that, every
-recorded `bash` before the fork point would run a second time. This works for pi's
+runs those tools for real — but only for what the recording cannot answer: a live tool
+is still overridden, its recorded calls are still served from the tape, a live call the
+recording already answered is reconnected first (the recorded answer is the world at
+the fork point; the real tool sees the directory as it is today), and only the rest
+reaches pi's real implementation. Without that, every recorded `bash` before the fork
+point would run a second time. This works for pi's
 built-in tools (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`), whose
 implementations pi exports. Any other tool named in `--live-tools` is left
 un-overridden, because pi-tape cannot reach its implementation, and the arm notice
@@ -468,15 +470,24 @@ warns that its *recorded* calls run again as well.
 In a fork, every tool the recording declared is overridden, not only the ones it
 used, so a live branch cannot reach an unrecorded built-in that was never allowed.
 
-### Two guards on the spend
+### What stops a fork, and what does not
 
-A miss on the very first request is flagged as a suspected hash mismatch *when the
-fork is aimed at a later turn* — nothing has diverged yet at that point, so it is a
-bug in the key rather than a counterfactual. Sending a different first prompt on
-purpose is not warned about; it is recorded as "diverged at the first request".
+A fork aimed at a later turn (`--at`) cannot legitimately go live before its
+intervention has been served — nothing has diverged at that point. So a request that
+misses the recording before then is a broken key (or a first prompt that differs from
+the recording), and the fork stops **without sending it**. That is the failure an
+unnoticed bill would come from: a field that differs between recording and replay
+turns every request into a miss, and each would otherwise be asked of a real model.
+`/tape status` shows "stopped unsent".
 
-The run stops once it has spent `--max-live-tokens` (50000 by default), with a message
-that says how much was spent instead of silently continuing.
+Past the intervention, a fork is an ordinary pi session and has no spend limit, just as
+any session does — a real setup sends its whole tool list with every request, so one
+live request can be tens of thousands of tokens, and a fixed default cut the
+experiment off after its first step. `--max-live-tokens N` sets a cap when you want
+one; `/tape status` always shows what was spent.
+
+Without `--at`, a different first prompt is the documented way to fork; it is recorded
+as "diverged at the first request", not raised as an alarm.
 
 ### Comparing the two runs
 

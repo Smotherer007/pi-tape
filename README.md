@@ -416,9 +416,11 @@ Specification and design rationale: [docs/RECIPES.md](docs/RECIPES.md).
    answer for a context the recording never contained. A live branch that repeats a
    recorded call gets the recorded result, so the run continues instead of stopping.
    `--at <turn> --result <text>` replaces one tool result first, which is the actual
-   "what if the tool had said something else" experiment. A miss on the very first
-   request is called out as a suspected hash mismatch, and the run stops once it has
-   spent `--max-live-tokens` (50000 by default) rather than discovering the bill later.
+   "what if the tool had said something else" experiment. A request that misses the
+   recording *before* the intervention has been served stops the fork unsent: nothing
+   has diverged yet, so it is a hash mismatch, not the experiment. Past the
+   intervention a fork is an ordinary session with no spend limit, unless one is set
+   with `--max-live-tokens N`.
 
 Every miss is recorded, never silent. `/tape status` and `inspect` show them, which
 is how you find out *why* a replay diverged.
@@ -485,9 +487,11 @@ A debugger that lies is worse than none, so:
   answer about a world it never produced. Anything else stops the run unless the tool
   is named in `--live-tools`.
 - **Live tools run in today's directory.** `--live-tools` runs pi's real
-  implementation for the branch's own calls (recorded calls are still served from the
-  tape). The directory it runs in is the world as it is now, not as it was at the fork
-  point, so a live branch of an old recording is not a faithful counterfactual. Only
+  implementation only for what the recording cannot answer: recorded calls are served
+  from the tape, and a live read the recording already answered (before its next
+  change) is reconnected first. What does reach the real tool sees the directory as it
+  is now, not as it was at the fork point, so a live branch of an old recording is not
+  a faithful counterfactual. Only
   pi's built-in tools can be run this way; any other tool in `--live-tools` is left
   un-overridden, and its recorded calls run again too. Executing a procedure is
   `pi-tape run`.
@@ -497,7 +501,7 @@ A debugger that lies is worse than none, so:
 ## Development
 
 ```bash
-npm test                    # the full suite (191 tests at this revision)
+npm test                    # the full suite (196 tests at this revision)
 npm run typecheck           # tsc --noEmit, clean
 npm run build               # tsc -p tsconfig.build.json -> dist/ (needed only to publish)
 node src/cli.ts inspect …   # the CLI is the fastest way to poke at the library

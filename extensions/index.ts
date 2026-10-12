@@ -126,14 +126,21 @@ interface Shadow {
  * stops the fork with an explanation. Recorded calls are always served from the tape,
  * live tools included, so the replayed prefix never runs its side effects again.
  *
- * `maxLiveTokens` is the brake, not a decoration. A miss that is a hash mismatch
- * rather than a real divergence would otherwise go live on every single request,
- * and the bill is the first thing anyone would notice.
+ * Past its divergence a fork is an ordinary pi session, and like one it has no spend
+ * limit unless asked for (`--max-live-tokens`). The failure a limit used to stand in
+ * for is caught directly instead: a request that misses the recording *before* the
+ * intervention has been served cannot be the experiment — nothing has diverged yet —
+ * so it is a hash mismatch, and the fork stops without sending it.
  */
 interface Fork {
 	provider: string;
 	modelId: string;
-	maxLiveTokens: number;
+	/** Optional cap on live tokens. Undefined means no cap, like any pi session. */
+	maxLiveTokens?: number;
+	/** Set once the intervened tool call has been answered with its replacement. */
+	interventionServed?: boolean;
+	/** Set when a request missed before the intervention, and the fork stopped. */
+	stoppedBeforeIntervention?: boolean;
 	liveTokens: number;
 	forks: number;
 	/** Live branches served from the recording because they repeated a recorded call. */
@@ -772,6 +779,19 @@ function failureMessage(
 	};
 }
 
+/** A stream that ends at once with an error the agent and the user can read. */
+function createStopStream(
+	model: { api: string; provider: string; id: string },
+	details: { text: string; errorMessage: string },
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	queueMicrotask(() => {
+		stream.push({ type: "error", reason: "error", error: failureMessage(model, details) });
+		stream.end();
+	});
+	return stream;
+}
+
 /**
  * Turn a recorded assistant message into a well-formed event stream.
  *
@@ -914,7 +934,7 @@ function createForkStream(
 		}
 
 		const label = `${fork.provider}/${fork.modelId}`;
-		if (fork.liveTokens >= fork.maxLiveTokens) {
+		if (fork.maxLiveTokens !== undefined && fork.liveTokens >= fork.maxLiveTokens) {
 			stream.push({
 				type: "error",
 				reason: "error",
@@ -1257,6 +1277,16 @@ function reconnectedPayload(entry: SessionEntry) {
 	};
 }
 
+/**
+ * The replaced tools, short enough to read. A real setup declares hundreds — every
+ * extension's tools — and the notice is for a person, not an inventory.
+ */
+function summarizeTools(names: string[], shown = 6): string {
+	if (!names.length) return "(none)";
+	if (names.length <= shown + 2) return names.join(", ");
+	return `${names.length} tools (${names.slice(0, shown).join(", ")}, … +${names.length - shown} more)`;
+}
+
 /** The read-only tools, for the arm notice. */
 const READ_ONLY_NAMES = ["read", "grep", "find", "ls"].filter(isReadOnlyTool);
 
@@ -1367,7 +1397,7 @@ function playCommand(
 		const fork: Fork = {
 			provider,
 			modelId: forkModel,
-			maxLiveTokens: maxLiveTokens ?? 50_000,
+			...(maxLiveTokens === undefined ? {} : { maxLiveTokens }),
 			liveTokens: 0,
 			forks: 0,
 			reconnected: 0,
@@ -1425,23 +1455,29 @@ function playCommand(
 			if (current.fork && liveRegistry) {
 				const prefix = entriesFromMessages((context as { messages: unknown[] }).messages);
 				if (!current.engine.lookupAssistant(prefix)) {
-					// A first-request miss is only alarming when this fork is aimed at a *later*
-					// turn: then the recorded prefix should have matched and did not. Without an
-					// intervention, sending a different first prompt is the documented way to
-					// fork, so the fact is recorded but not raised as an alarm.
+					// Aimed at a later turn and not there yet: the recorded prefix should have
+					// matched and did not. That is a bug in the key (or a prompt that differs
+					// from the recording), not the experiment, so nothing is sent.
+					if (current.fork.intervention && !current.fork.interventionServed) {
+						current.fork.stoppedBeforeIntervention = true;
+						return createStopStream(typed, {
+							text: "tape: this request is not in the recording, and the fork has not reached its intervention yet",
+							errorMessage:
+								`tape: this request is not in the recording, but the fork has not reached its intervention ` +
+								`(${current.fork.intervention.toolName} turn ${current.fork.intervention.turn}) yet. ` +
+								"Nothing has diverged at this point, so this is a hash mismatch — or a first prompt that differs from the recording. " +
+								`Nothing was sent to ${current.fork.provider}/${current.fork.modelId}. Send the recording's original first prompt; ` +
+								"if it was the original, /tape status shows the miss and it is a bug worth reporting.",
+						});
+					}
+					// Without an intervention, a different first prompt is the documented way to
+					// fork; the fact is recorded for the report, not raised as an alarm.
 					if (
 						current.fork.forks === 0 &&
 						current.engine.status().assistantConsumed === 0 &&
 						!current.fork.firstMissed
 					) {
 						current.fork.firstMissed = true;
-						if (current.fork.intervention) {
-							ctx.ui.notify(
-								"tape: the first request is not in the recording, but this fork is aimed at a later turn.\n" +
-									"That is a hash mismatch rather than a divergence — check /tape status before spending tokens.",
-								"warning",
-							);
-						}
 					}
 					return createForkStream(current, liveRegistry, context as { messages: unknown[] }, options, typed);
 				}
@@ -1500,6 +1536,7 @@ function playCommand(
 				// An armed intervention wins: this is the counterfactual being tested.
 				const replacement = current.engine.toolResultOverride(toolCallId);
 				if (replacement !== undefined) {
+					if (current.fork) current.fork.interventionServed = true;
 					return { content: replacement as never, details: { tape: "override" } as never };
 				}
 
@@ -1508,15 +1545,11 @@ function playCommand(
 
 				let reason = outcome.reason;
 				if (current.fork) {
-					// Past the divergence a live tool runs for real. Its recorded calls were
-					// served above, so only this branch's own calls get here.
-					if (current.fork.liveTools.includes(name)) {
-						return runLiveTool(current.fork, name, toolCallId, params, signal, onUpdate, toolCtx);
-					}
-
 					// A live branch that asks for what the recording already did gets the
-					// recorded answer, so the run continues instead of stopping one thought
-					// later — as long as the recording still describes this branch's world.
+					// recorded answer — as long as the recording still describes this branch's
+					// world. This comes first even for a live tool: the recorded answer is the
+					// world at the fork point, while the real tool sees the directory as it is
+					// today, which may have moved on since the recording.
 					if (current.fork.liveMutated) {
 						reason = "a live tool has changed things in this branch, so the recording no longer describes it";
 					} else {
@@ -1526,6 +1559,11 @@ function playCommand(
 							return reconnectedPayload(reconnected.entry);
 						}
 						reason = reconnected.reason;
+					}
+
+					// Only what the recording cannot answer reaches the real tool.
+					if (current.fork.liveTools.includes(name)) {
+						return runLiveTool(current.fork, name, toolCallId, params, signal, onUpdate, toolCtx);
 					}
 				}
 
@@ -1546,21 +1584,26 @@ function playCommand(
 	const lines = [
 		`tape armed → ${path}`,
 		`  recorded      ${tape.stats.assistantMessages} assistant / ${tape.stats.toolResults} tool results · $${tape.stats.costUsd.toFixed(4)}`,
-		`  tools replaced ${active.registeredTools.join(", ") || "(none)"}`,
+		`  tools replaced ${summarizeTools(active.registeredTools)}`,
 	];
 	if (active.fork) {
 		lines.push(
 			`  fork          a request the recording does not contain goes to ${active.fork.provider}/${active.fork.modelId}`,
-			`                budget ${active.fork.maxLiveTokens} live tokens; the recorded prefix stays free`,
+			active.fork.maxLiveTokens === undefined
+				? "                no live budget (cap it with --max-live-tokens N); the recorded prefix stays free"
+				: `                budget ${active.fork.maxLiveTokens} live tokens; the recorded prefix stays free`,
 		);
 		if (active.fork.intervention) {
 			const { turn, toolName, toolCallId, result } = active.fork.intervention;
-			lines.push(`  intervention  ${toolName} turn ${turn} (${toolCallId}) → ${JSON.stringify(previewText(result))}`);
+			lines.push(
+				`  intervention  ${toolName} turn ${turn} (${toolCallId}) → ${JSON.stringify(previewText(result))}`,
+				"                a request that misses the recording before this point stops the fork unsent",
+			);
 		}
 		if (active.fork.liveTools.length) {
 			lines.push(
-				`  live tools    ${active.fork.liveTools.join(", ")} run for real once the fork leaves the recording`,
-				"                their recorded calls are still served from the tape, so nothing runs twice",
+				`  live tools    ${active.fork.liveTools.join(", ")} run for real where the recording has no answer`,
+				"                recorded calls, and reads the recording already answered, still come from the tape",
 			);
 		}
 		if (active.fork.unreachableLiveTools.length) {
@@ -1714,16 +1757,17 @@ function statusCommand(ctx: ExtensionCommandContext): void {
 				: "",
 			armed.fork
 				? `  fork       ${armed.fork.forks} request(s) the recording lacked → ` +
-					`${armed.fork.provider}/${armed.fork.modelId} · ${armed.fork.liveTokens}/${armed.fork.maxLiveTokens} tokens` +
+					`${armed.fork.provider}/${armed.fork.modelId} · ${armed.fork.liveTokens}${armed.fork.maxLiveTokens === undefined ? "" : `/${armed.fork.maxLiveTokens}`} tokens` +
+					(armed.fork.stoppedBeforeIntervention
+						? "\n  fork       ! a request missed the recording before the intervention — stopped unsent (hash mismatch, or a different first prompt)"
+						: "") +
 					(armed.fork.reconnected ? `\n  fork       ${armed.fork.reconnected} live call(s) reconnected to the recording` : "") +
 					(armed.fork.liveRuns ? `\n  fork       ${armed.fork.liveRuns} live tool call(s) run for real` : "") +
 					(armed.fork.intervention
 						? `\n  fork       ${armed.fork.intervention.toolName} turn ${armed.fork.intervention.turn} was replaced with ${JSON.stringify(previewText(armed.fork.intervention.result))}`
 						: "") +
-					(armed.fork.firstMissed
-						? armed.fork.intervention
-							? "\n  fork       ! the first request missed the recording — treat that as a hash mismatch until proven otherwise"
-							: "\n  fork       the run diverged at the first request (a different prompt, or a hash mismatch)"
+					(armed.fork.firstMissed && !armed.fork.intervention
+						? "\n  fork       the run diverged at the first request (a different prompt, or a hash mismatch)"
 						: "")
 				: "",
 		]
@@ -1792,7 +1836,7 @@ export default function (pi: ExtensionAPI) {
 					if (!target) {
 						ctx.ui.notify(
 							"Usage: /tape fork <file.tape> --model <provider>/<model> [options]\n" +
-								"  --max-live-tokens N   token budget (default 50000); the run stops when it is spent\n" +
+								"  --max-live-tokens N   optional token cap; the run stops when it is spent (default: none)\n" +
 								"  --at <turn|toolCallId> --result <text|@file>\n" +
 								"                        answer that tool call differently, then continue with the model\n" +
 								"  --live-tools a,b      run pi's real tool for the fork's own calls (recorded ones stay on tape)",
@@ -1906,7 +1950,7 @@ export default function (pi: ExtensionAPI) {
 							"    --at <turn|id> --result <text|@file>",
 							"                           answer one tool call differently, then continue live",
 							"    --live-tools a,b       run pi's real tool for the fork's own calls (recorded ones stay on tape)",
-							"    --max-live-tokens N    token budget (default 50000)",
+							"    --max-live-tokens N    optional token cap (default: none)",
 							"  /tape regress            what the shadow model answered differently",,
 							"  /tape status             replay progress, misses, shadow and fork progress",
 							"  /tape stop               disarm (then /reload to restore real tools)",
