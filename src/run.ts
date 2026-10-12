@@ -209,7 +209,7 @@ export function bindRecipe(recipe: Recipe, options: BindOptions = {}): BindResul
 	const env = options.env ?? process.env;
 	const notes: string[] = [];
 
-	for (const gap of unfilledGaps(recipe, composeRecipe(recipe, assignments))) {
+	for (const gap of unfilledGaps(recipe, composeRecipe(recipe, assignments, { quoteValues: true }))) {
 		if (assignments[gap.name] !== undefined) continue;
 		const found = envCandidates(gap).find((candidate) => (env[candidate] ?? "") !== "");
 		if (!found) continue;
@@ -217,7 +217,7 @@ export function bindRecipe(recipe: Recipe, options: BindOptions = {}): BindResul
 		notes.push(`${gap.name} ← $${found} (${gap.kind})`);
 	}
 
-	const steps = composeRecipe(recipe, assignments);
+	const steps = composeRecipe(recipe, assignments, { quoteValues: true });
 	const gaps = unfilledGaps(recipe, steps);
 	for (const gap of gaps) notes.push(`${gap.name} left open (${gap.kind}): ${gap.hint}`);
 

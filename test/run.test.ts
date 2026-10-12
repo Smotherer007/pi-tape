@@ -61,7 +61,7 @@ test("a secret gap is filled from the environment, and never from a well-known v
 	assert.ok(gap, "the publish family has a credential slot");
 
 	const found = bindRecipe(recipe, { env: { [gap.name.toUpperCase()]: "npm_from_env" } });
-	assert.deepEqual(found.steps, ["npm publish --token npm_from_env"]);
+	assert.deepEqual(found.steps, ["npm publish --token 'npm_from_env'"], "the value is quoted for the shell");
 	assert.deepEqual(found.gaps, []);
 	assert.match(found.notes[0] ?? "", /← \$TOKEN/);
 
@@ -104,14 +104,38 @@ test("a path gap is not looked up in the environment", () => {
 	assert.equal(bound.gaps[0]?.kind, "path");
 
 	// An explicit assignment still wins, because that is a decision, not a guess.
-	assert.deepEqual(bindRecipe(fake, { set: { path: "./target" } }).steps, ["rm -rf ./target"]);
+	assert.deepEqual(bindRecipe(fake, { set: { path: "./target" } }).steps, ["rm -rf './target'"], "a bound value is quoted");
 });
 
 test("binding reports what it filled and why", () => {
 	const recipe = learned(serviceFamily(), "service");
 	const bound = bindRecipe(recipe, { set: { package: "fastapi", port: "8000" } });
-	assert.deepEqual(bound.steps[1], "pip install fastapi");
+	assert.deepEqual(bound.steps[1], "pip install 'fastapi'");
 	assert.deepEqual(bound.gaps, []);
+});
+
+test("a value with a space stays one argument, and a value inside quotes is not wrapped again", () => {
+	const recipe = learned(serviceFamily(), "service");
+	const step = recipe.steps[0] as Recipe["steps"][number];
+
+	// Bare placeholder: the value becomes a single quoted word, so a space or a
+	// semicolon cannot split the command or start a second one.
+	const bare: Recipe = { ...recipe, steps: [{ ...step, template: "mkdir {{name}}", usesSlots: ["name"] }] };
+	assert.deepEqual(bindRecipe(bare, { set: { name: "my notes; rm -rf /" } }).steps, [
+		"mkdir 'my notes; rm -rf /'",
+	]);
+
+	// Already inside double quotes: escaping in place, not adding quotes, or the
+	// quotes would end up in the value.
+	const quoted: Recipe = { ...recipe, steps: [{ ...step, template: 'git commit -m "{{message}}"', usesSlots: ["message"] }] };
+	assert.deepEqual(bindRecipe(quoted, { set: { message: 'fix: say "hi"' } }).steps, [
+		'git commit -m "fix: say \\"hi\\""',
+	]);
+
+	// A single quote inside a bare value is closed and reopened, which is the only
+	// way to put one inside single quotes.
+	const apostrophe: Recipe = { ...recipe, steps: [{ ...step, template: "echo {{word}}", usesSlots: ["word"] }] };
+	assert.deepEqual(bindRecipe(apostrophe, { set: { word: "it's" } }).steps, ["echo 'it'\\''s'"]);
 });
 
 // ---------------------------------------------------------------------------

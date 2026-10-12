@@ -268,10 +268,69 @@ export function queryRecipes(
 }
 
 /**
+ * Fill `{{slot}}` placeholders, optionally making the values shell-safe.
+ *
+ * When `quote` is on, a value is quoted for the position it lands in: a bare
+ * placeholder gets single quotes, so a value with a space or a `;` stays one
+ * argument, while a placeholder already inside quotes is escaped in place instead
+ * of wrapped — `git commit -m "{{message}}"` must not end up with literal quotes
+ * in the commit message. Left off, the template is rendered exactly as recorded.
+ */
+function renderTemplate(template: string, values: Map<string, string>, quote: boolean): string {
+	let out = "";
+	let quoteState: ShellQuoteContext = "none";
+	let i = 0;
+	while (i < template.length) {
+		const match = template.startsWith("{{", i) ? /^\{\{(\w+)\}\}/.exec(template.slice(i)) : null;
+		if (match) {
+			const value = values.get(match[1] as string);
+			out += value === undefined || !quote ? (value ?? match[0]) : quoteShellValue(value, quoteState);
+			i += match[0].length;
+			continue;
+		}
+		const char = template[i] as string;
+		if (char === "\\" && quoteState !== "single") {
+			out += char + (template[i + 1] ?? "");
+			i += 2;
+			continue;
+		}
+		if (char === "'" && quoteState !== "double") quoteState = quoteState === "single" ? "none" : "single";
+		else if (char === '"' && quoteState !== "single") quoteState = quoteState === "double" ? "none" : "double";
+		out += char;
+		i += 1;
+	}
+	return out;
+}
+
+/** Which quoting context a placeholder sits in. */
+export type ShellQuoteContext = "none" | "single" | "double";
+
+/**
+ * One value, made safe for the shell context it is about to land in.
+ *
+ * Single quotes make everything inside them literal, and an embedded quote is
+ * closed and reopened (`'\''`). Double quotes still expand `$`, backticks and
+ * `\`, so those are escaped; a single quote needs nothing there.
+ */
+export function quoteShellValue(value: string, context: ShellQuoteContext): string {
+	if (context === "single") return value.replaceAll("'", "'\\''");
+	if (context === "double") return value.replace(/[\\$`"]/g, "\\$&");
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
  * Render a recipe as concrete steps, with parameter variants substituted.
  * Unfilled slots stay as `{{name}}` so it is obvious what still needs a value.
+ *
+ * `quoteValues` is off by default, because a recipe's text is also what `dub`
+ * prints for a human to read; `run` turns it on, because there the text becomes a
+ * command line and a value with a space in it must not split into two arguments.
  */
-export function composeRecipe(recipe: Recipe, assignments: Record<string, string> = {}): string[] {
+export function composeRecipe(
+	recipe: Recipe,
+	assignments: Record<string, string> = {},
+	options: { quoteValues?: boolean } = {},
+): string[] {
 	const parameterValues = new Map<string, string>();
 	const unmatched: string[] = [];
 
@@ -315,7 +374,7 @@ export function composeRecipe(recipe: Recipe, assignments: Record<string, string
 
 	const out: string[] = [];
 	recipe.steps.forEach((step, stepIndex) => {
-		let text = step.template;
+		const values = new Map<string, string>();
 		for (const slot of step.usesSlots) {
 			// An explicit assignment wins over the variant, and the order matters:
 			// a parameter is a *guess* that its members move together, and with a thin
@@ -323,13 +382,13 @@ export function composeRecipe(recipe: Recipe, assignments: Record<string, string
 			// what the caller asked for is the one outcome that is always wrong here.
 			const direct = assignments[slot];
 			if (direct !== undefined) {
-				text = text.replaceAll(`{{${slot}}}`, direct);
+				values.set(slot, direct);
 				continue;
 			}
 			const fromParameter = parameterValues.get(`${stepIndex}#${slot}`);
-			if (fromParameter !== undefined) text = text.replaceAll(`{{${slot}}}`, fromParameter);
+			if (fromParameter !== undefined) values.set(slot, fromParameter);
 		}
-		out.push(text);
+		out.push(renderTemplate(step.template, values, options.quoteValues === true));
 	});
 
 	return out;
