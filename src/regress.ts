@@ -156,14 +156,23 @@ function effectiveActions(calls: ToolCallShape[]): string {
 	const actions: string[] = [];
 	for (const call of calls) {
 		if (isReadOnlyTool(call.name)) continue;
+		// pi-tape's own tools look things up; a differently worded search is not a
+		// different procedure.
+		if (call.name.startsWith("tape_")) continue;
 		let args: Record<string, unknown> = {};
 		try {
 			args = JSON.parse(call.arguments) as Record<string, unknown>;
 		} catch {}
+		// Only the command line acts. A timeout or a working-directory option says how
+		// it was run, and models set them differently from one answer to the next.
 		if (call.name === "bash" && typeof args.command === "string") {
 			for (const segment of splitSequence(args.command)) {
-				if (isNoiseCommand(analyzeCommand(segment).key)) continue;
-				actions.push(`bash ${segment.replace(/\s+/g, " ").trim()}`);
+				const trimmed = segment.replace(/\s+/g, " ").trim();
+				// `cd` moves, it does not act — `cd /abs/path && ./tool x` and `./tool x`
+				// run the same thing.
+				if (/^cd(\s|$)/.test(trimmed)) continue;
+				if (isNoiseCommand(analyzeCommand(trimmed).key)) continue;
+				actions.push(`bash ${trimmed}`);
 			}
 			continue;
 		}

@@ -41,6 +41,9 @@ const REPO = resolve(HERE, "..");
 const REPORT = join(OUT, "knowledge-report.md");
 const EXT = process.env.TAPE_EXT || join(REPO, "extensions", "index.ts");
 const ROOT = mkdtempSync(join(tmpdir(), "tape-knowledge-"));
+// A working folder has no siblings the model could find with `ls ..`: in an earlier
+// run of this check, a model read the notes and tapes of the other runs that way.
+const isolated = (prefix) => mkdtempSync(join(tmpdir(), `tape-ws-${prefix}-`));
 const REPEATS = Math.max(1, Number(process.env.REPEATS ?? 2) || 2);
 
 // ---------------------------------------------------------------------------
@@ -152,7 +155,7 @@ function sealed() {
 }
 
 function workspace(label, agentsMd) {
-	const dir = mkdtempSync(join(ROOT, `${label}-`));
+	const dir = isolated(label);
 	writeFileSync(join(dir, "shipit"), sealed());
 	chmodSync(join(dir, "shipit"), 0o755);
 	writeFileSync(join(dir, ".shipit-token"), "team-7f3a\n");
@@ -370,7 +373,7 @@ async function main() {
 	check(!real.ok || real.failedCalls > 0, `reality: with the deleted rule the run ${real.ok ? `still deployed, but only after ${real.failedCalls} failed call(s)` : "did not deploy"}`);
 	const shadowTokens = outcome.regression.reduce((sum, r) => sum + r.tokens, 0) / outcome.regression.length;
 	log(`\ncost of catching it: ~${shadowTokens.toFixed(0)} tokens per shadow, nothing executed · a real run with the change: ${real.tokens} tokens, and it ran shipit for real`);
-	log(`\n(everything is in ${ROOT} — delete it whenever you like)`);
+	log(`\n(data in ${ROOT}, working folders in ${tmpdir()}/tape-ws-* — delete them whenever you like)`);
 }
 
 main()

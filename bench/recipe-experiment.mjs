@@ -58,6 +58,9 @@ const RAW = join(OUT, "experiment-runs.json");
 const EXT = process.env.TAPE_EXT || join(REPO, "extensions", "index.ts");
 const CLI = join(REPO, "src", "cli.ts");
 const ROOT = mkdtempSync(join(tmpdir(), "tape-experiment-"));
+// A working folder has no siblings the model could find with `ls ..`: in an earlier
+// run of this check, a model read the notes and tapes of the other runs that way.
+const isolated = (prefix) => mkdtempSync(join(tmpdir(), `tape-ws-${prefix}-`));
 const REPEATS = Math.max(1, Number(process.env.REPEATS ?? 3) || 3);
 const FAMILIES = (process.env.FAMILIES ?? "open,sealed").split(",").map((item) => item.trim()).filter(Boolean);
 
@@ -167,7 +170,7 @@ function sealed() {
 }
 
 function workspace(label, family = "open") {
-	const dir = mkdtempSync(join(ROOT, `${label}-`));
+	const dir = isolated(label);
 	writeFileSync(join(dir, "shipit"), family === "sealed" ? sealed() : SHIPIT);
 	chmodSync(join(dir, "shipit"), 0o755);
 	writeFileSync(join(dir, ".shipit-token"), "team-7f3a\n");
@@ -352,7 +355,7 @@ async function main() {
 		log(`training cost ${family} (paid once, for notes and recipes alike): $${train.reduce((sum, r) => sum + (Number(r.cost) || 0), 0).toFixed(4)} over ${train.length} runs`);
 	}
 	log(`raw data: ${RAW}`);
-	log(`(everything is in ${ROOT} — delete it whenever you like)`);
+	log(`(data in ${ROOT}, working folders in ${tmpdir()}/tape-ws-* — delete them whenever you like)`);
 }
 
 async function runFamily(family) {

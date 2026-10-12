@@ -44,6 +44,9 @@ const REPO = resolve(HERE, "..");
 const REPORT = join(OUT, "prove-report.md");
 const EXT = process.env.TAPE_EXT || join(REPO, "extensions", "index.ts");
 const ROOT = mkdtempSync(join(tmpdir(), "tape-prove-"));
+// A working folder has no siblings the model could find with `ls ..`: in an earlier
+// run of this check, a model read the notes and tapes of the other runs that way.
+const isolated = (prefix) => mkdtempSync(join(tmpdir(), `tape-ws-${prefix}-`));
 
 // ---------------------------------------------------------------------------
 // finding pi (same as tape-check)
@@ -207,7 +210,7 @@ const P2 =
 const WORDS = { f01: "amber", f02: "birch", f03: "cobalt", f04: "dune", f05: "ember", f06: "fjord", f07: "garnet", f08: "harbor" };
 
 function longWorkspace() {
-	const dir = mkdtempSync(join(ROOT, "long-"));
+	const dir = isolated("long");
 	mkdirSync(join(dir, ".pi"));
 	// Low enough that this small run can be compacted on request; it applies to this folder only.
 	writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 1500 } }));
@@ -321,7 +324,7 @@ async function proveModel(model) {
 async function proveDebugging(model) {
 	const scope = `debug ${model.provider}/${model.id}`;
 	log(`\n## debugging case: a wrong answer, traced to its cause`);
-	const dir = mkdtempSync(join(ROOT, "debug-"));
+	const dir = isolated("debug");
 	writeFileSync(join(dir, "notes.md"), "# Service notes\n\nThe service listens on port 3000.\n");
 	writeFileSync(join(dir, "config.json"), JSON.stringify({ service: { port: 8080 } }, null, 2) + "\n");
 	const ask = "Which port does the service listen on? Read notes.md — only that file — and answer with just the number.";
@@ -379,7 +382,7 @@ async function proveDebugging(model) {
 // main
 // ---------------------------------------------------------------------------
 async function chooseModels() {
-	const probeDir = mkdtempSync(join(ROOT, "probe-"));
+	const probeDir = isolated("probe");
 	const pi = startPi(probeDir, "probe");
 	const state = await pi.send({ type: "get_state" });
 	const list = await pi.send({ type: "get_available_models" });
@@ -429,7 +432,7 @@ async function main() {
 	}
 	log(`\n## result`);
 	results.forEach((line) => log(line));
-	log(`\n(everything is in ${ROOT} — delete it whenever you like)`);
+	log(`\n(data in ${ROOT}, working folders in ${tmpdir()}/tape-ws-* — delete them whenever you like)`);
 }
 
 main()

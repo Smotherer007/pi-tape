@@ -350,3 +350,21 @@ test("looking around differently is not a different procedure; acting differentl
 	const optionals = compareAnswers(read({ path: "a", offset: null, limit: null }), read({ path: "a" }));
 	assert.equal(optionals.length, 0, "an unset optional is not a different call");
 });
+
+test("a lookup, a cd, an echo or a timeout does not make an action different", async () => {
+	const { compareAnswers } = await import("../src/regress.ts");
+	const shape = (calls: Array<[string, Record<string, unknown>]>) => ({
+		text: "",
+		toolCalls: calls.map(([name, args]) => ({ name, arguments: JSON.stringify(args) })),
+		stopReason: "toolUse",
+	});
+	const recorded = shape([
+		["tape_search", { query: "deploy service to prod with shipit, bump first" }],
+		["bash", { command: 'cd /tmp/work && ./shipit login --token-file t; echo "LOGIN_EXIT=$?"', timeout: 120 }],
+	]);
+	const live = shape([
+		["tape_search", { query: "deploy billing with shipit" }],
+		["bash", { command: "./shipit login --token-file t" }],
+	]);
+	assert.deepEqual(compareAnswers(recorded, live).map((item) => item.kind), ["inspection"]);
+});
