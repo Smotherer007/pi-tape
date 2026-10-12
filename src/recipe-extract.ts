@@ -28,6 +28,12 @@ export interface ExtractOptions {
 	scope?: "global" | "project";
 	/** Drop tool calls whose verb appears in this list (e.g. pure reconnaissance). */
 	excludeVerbs?: string[];
+	/**
+	 * Keep tool calls that ended in an error. Off by default: a call that failed did
+	 * not do anything the procedure needs — it is how the run found out what it had to
+	 * do instead, and that is already in the call that came after it.
+	 */
+	keepFailedCalls?: boolean;
 }
 
 export interface ExtractResult {
@@ -36,6 +42,8 @@ export interface ExtractResult {
 	sequence: Array<{ key: string; verb: string; kind: StepKind; template: string; example: string }>;
 	/** The raw entries walked, for diagnostics. */
 	entries: SessionEntry[];
+	/** Tool calls left out because they ended in an error. */
+	failedCalls: number;
 }
 
 /** Guess a slot name from what was replaced and where. */
@@ -207,8 +215,25 @@ export function extractRecipe(tape: TapeFile, options: ExtractOptions = {}): Ext
 	const slotsByName = new Map<string, Slot>();
 	const exclude = new Set(options.excludeVerbs ?? []);
 
+	// A recording of an agent finding its way is full of calls that failed: the deploy
+	// without the flag it did not know about, the login without the token. Those are the
+	// trajectory, not the procedure, and a recipe made of them repeats the mistakes and
+	// — worse — can lose the step that worked, because that one varied between runs.
+	const failedCallIds = new Set<string>();
+	for (const entry of entries) {
+		const message = messageOf(entry);
+		if (message?.role === "toolResult" && message.isError === true && typeof message.toolCallId === "string") {
+			failedCallIds.add(message.toolCallId);
+		}
+	}
+	let failedCalls = 0;
+
 	for (const entry of entries) {
 		for (const call of toolCallsOf(entry)) {
+			if (!options.keepFailedCalls && failedCallIds.has(call.id)) {
+				failedCalls++;
+				continue;
+			}
 			const args = (call.arguments ?? {}) as Record<string, unknown>;
 			const built = buildStep(call.name, args);
 			if (exclude.has(built.step.verb)) continue;
@@ -285,7 +310,7 @@ export function extractRecipe(tape: TapeFile, options: ExtractOptions = {}): Ext
 	recipe.orthogonality = recipe.steps.length ? distinct / recipe.steps.length : 0;
 	void meaningful;
 
-	return { recipe, sequence, entries };
+	return { recipe, sequence, entries, failedCalls };
 }
 
 /** Rewrite a template's placeholders to canonical slot names. */

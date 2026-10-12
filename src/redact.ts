@@ -194,9 +194,15 @@ const ENVIRONMENT_NAMES = new Set([
 /** Slot names that describe a location. */
 const LOCATION_NAMES = new Set(["path", "target", "dir", "directory", "folder", "cwd", "file"]);
 
-/** Value shapes that are a location no matter what the slot is called. */
+/**
+ * Value shapes that are a location outside the project, no matter what the slot is
+ * called. `./tool` is not one of them: it is relative to the project, as portable as
+ * `src/main.py`, and treating it as machine-specific left every project script — the
+ * very thing a project recipe is about — as an open gap. `../` leaves the project and
+ * stays one.
+ */
 function looksLikeAbsolutePath(value: string): boolean {
-	return /^(\.{1,2}\/|\/|~\/|[A-Za-z]:[\\/])/.test(value);
+	return /^(\.\.\/|\/|~\/|[A-Za-z]:[\\/])/.test(value);
 }
 
 /**

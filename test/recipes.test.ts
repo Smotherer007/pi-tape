@@ -334,3 +334,68 @@ test("intersecting a single recipe is the identity", () => {
 	assert.equal(result.sharedSteps, recipe.steps.length);
 	assert.equal(result.recipe.observations, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Learning from runs that had to find their way
+// ---------------------------------------------------------------------------
+
+/** A recording where some commands failed: `[command, failed]` pairs, in order. */
+function exploringRecording(calls: Array<[string, boolean]>, name: string): TapeFile {
+	const entries = [systemEntry("s2000", null)];
+	let parent = "s2000";
+	calls.forEach(([command, failed], index) => {
+		const assistantId = `a${2000 + index}`;
+		const resultId = `t${2000 + index}`;
+		entries.push(assistantToolCall(assistantId, parent, "bash", { command }));
+		entries.push(toolResultEntry(resultId, assistantId, "bash", failed ? "shipit: error" : "ok", failed));
+		parent = resultId;
+	});
+	return recordSession(parseSession(sessionText(entries)), { name }).tape;
+}
+
+const shipitRun = (service: string, env: string): Array<[string, boolean]> => [
+	["./shipit --help", false],
+	[`./shipit deploy ${service}`, true],
+	["./shipit login", true],
+	["./shipit login --token-file .shipit-token", false],
+	[`./shipit deploy ${service}`, true],
+	[`./shipit deploy ${service} --env ${env}`, false],
+];
+
+test("a run that recovered from its errors is unknown, not failed", () => {
+	const tape = exploringRecording(shipitRun("api", "staging"), "recovered");
+	assert.equal(tape.outcome?.status, "unknown", "the last call succeeded: the run went on past its errors");
+	assert.match(tape.outcome?.evidence[0] ?? "", /3 tool error\(s\) recovered from/);
+
+	const stuck = exploringRecording([["./shipit deploy api", true]], "stuck");
+	assert.equal(stuck.outcome?.status, "failed", "a run that ends on an error still failed");
+});
+
+test("calls that failed are not part of the procedure", () => {
+	const tape = exploringRecording(shipitRun("api", "staging"), "explore");
+	const { recipe, failedCalls } = extractRecipe(tape);
+	assert.equal(failedCalls, 3);
+	assert.deepEqual(
+		recipe.steps.map((step) => step.example),
+		["./shipit --help", "./shipit login --token-file .shipit-token", "./shipit deploy api --env staging"],
+	);
+	assert.equal(extractRecipe(tape, { keepFailedCalls: true }).recipe.steps.length, 6, "and can be kept on request");
+});
+
+test("a project's own tool is learned as a family: the arguments that differ become parameters", () => {
+	const recipes = [
+		exploringRecording(shipitRun("api", "staging"), "a"),
+		exploringRecording(shipitRun("web", "staging"), "b"),
+		exploringRecording(shipitRun("api", "prod"), "c"),
+	].map((tape) => extractRecipe(tape, { scope: "project" }).recipe);
+
+	const { recipe } = intersectRecipes(recipes, { name: "shipit-deploy", scope: "project" });
+	const templates = recipe.steps.map((step) => step.template);
+	assert.deepEqual(templates.slice(0, 2), ["./shipit --help", "./shipit login --token-file .shipit-token"]);
+	assert.match(templates[2] ?? "", /^\.\/shipit deploy \{\{\w+\}\} --env \{\{env\}\}$/, "no rule pack knows shipit; the family does");
+
+	const env = recipe.parameters.find((parameter) => parameter.name === "env");
+	assert.ok(env, "env is a parameter");
+	assert.deepEqual(env.variants.map((variant) => variant.label).sort(), ["prod", "staging"]);
+	assert.ok(!recipe.slots.some((slot) => slot.kind === "path"), "./shipit is part of the project, not a machine path");
+});

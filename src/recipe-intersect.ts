@@ -123,7 +123,7 @@ interface Prepared {
 }
 
 function prepare(recipes: Recipe[], includeNoise: boolean): Prepared[] {
-	return recipes.map((recipe) => {
+	const prepared = recipes.map((recipe) => {
 		const steps: Step[] = [];
 		const keys: string[] = [];
 		const origin: number[] = [];
@@ -133,12 +133,99 @@ function prepare(recipes: Recipe[], includeNoise: boolean): Prepared[] {
 				noise++;
 				return;
 			}
-			steps.push(step);
+			steps.push(structuredClone(step));
 			keys.push(step.key);
 			origin.push(index);
 		});
 		return { steps, keys, origin, noise };
 	});
+	generalizeLiteralVariants(prepared);
+	return prepared;
+}
+
+/**
+ * Turn the arguments that differ between recordings into slots, for commands no rule
+ * pack knows.
+ *
+ * A rule pack knows that the third word of `npm install` is a package. Nothing knows
+ * that the third word of `./shipit deploy` is a service — the project's own tools are
+ * exactly the ones no rule pack will ever cover, and they are what a project recipe is
+ * for. Without this, `./shipit deploy api --env staging` and `./shipit deploy web --env
+ * prod` are two unrelated steps, each seen once, and the step that matters most falls
+ * out of the skeleton.
+ *
+ * So the family itself is the rule: steps with the same verb and the same number of
+ * words are compared word by word, and a word that differs between them becomes a
+ * slot. A word every recording agrees on stays literal. This is anti-unification over
+ * the words of a command, done only where the template spells the command word for
+ * word, so the rewritten template still means what was run.
+ */
+function generalizeLiteralVariants(prepared: Prepared[]): void {
+	type Ref = { recording: number; index: number; words: string[]; templateWords: string[] };
+	const groups = new Map<string, Ref[]>();
+
+	prepared.forEach((item, recording) => {
+		item.steps.forEach((step, index) => {
+			if (step.kind !== "command") return;
+			const words = step.key.split(" ");
+			const templateWords = step.template.split(" ");
+			// Only when key and template line up word for word: quoting, redirections
+			// and compound commands are left to the rule packs.
+			if (words.length !== templateWords.length) return;
+			if (/&&|\|\||;|\|/.test(step.key)) return;
+			const group = `${step.verb}#${words.length}`;
+			const list = groups.get(group) ?? [];
+			list.push({ recording, index, words, templateWords });
+			groups.set(group, list);
+		});
+	});
+
+	for (const refs of groups.values()) {
+		// A difference only means something across recordings.
+		if (new Set(refs.map((ref) => ref.recording)).size < 2) continue;
+		const width = (refs[0] as Ref).words.length;
+		const varying: number[] = [];
+		for (let position = 0; position < width; position++) {
+			const values = new Set(refs.map((ref) => ref.words[position]));
+			const literal = refs.every((ref) => !/\{\{|<\*>/.test(ref.templateWords[position] ?? "") && ref.words[position] === ref.templateWords[position]);
+			if (values.size > 1 && literal) varying.push(position);
+		}
+		if (!varying.length) continue;
+
+		// One name per position, the same in every recording: the slot is matched by
+		// name later, and `api` and `web` must land in the same one.
+		const first = refs[0] as Ref;
+		const firstStep = (prepared[first.recording] as Prepared).steps[first.index] as Step;
+		const used = new Set(refs.flatMap((ref) => ((prepared[ref.recording] as Prepared).steps[ref.index] as Step).usesSlots));
+		const names = new Map<number, string>();
+		for (const position of varying) {
+			const previous = first.words[position - 1] ?? "";
+			const base = /^--?[A-Za-z][\w-]*$/.test(previous)
+				? previous.replace(/^-+/, "").replace(/-/g, "_")
+				: proposeSlotName(firstStep.verb, first.words[position] as string, firstStep.example) || "arg";
+			let name = base;
+			let suffix = 2;
+			while (used.has(name)) name = `${base}${suffix++}`;
+			used.add(name);
+			names.set(position, name);
+		}
+
+		for (const ref of refs) {
+			const step = (prepared[ref.recording] as Prepared).steps[ref.index] as Step;
+			for (const position of varying) {
+				const value = ref.words[position] as string;
+				const name = names.get(position) as string;
+				ref.words[position] = "<*>";
+				ref.templateWords[position] = `{{${name}}}`;
+				step.usesSlots.push(name);
+				step.slotValues[name] = value;
+				step.slotKinds = { ...(step.slotKinds ?? {}), [name]: classifyGapKind({ name, value }) };
+			}
+			step.key = ref.words.join(" ");
+			step.template = ref.templateWords.join(" ");
+			(prepared[ref.recording] as Prepared).keys[ref.index] = step.key;
+		}
+	}
 }
 
 export function intersectRecipes(allRecipes: Recipe[], options: IntersectOptions = {}): IntersectResult {

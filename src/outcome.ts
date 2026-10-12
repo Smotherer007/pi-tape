@@ -91,6 +91,22 @@ export function deriveOutcome(entries: SessionEntry[], declared?: TapeOutcomeSta
 			: { status: "success", evidence: [`verification succeeded: ${summarize(verification.command as string)}`, ...earlier] };
 	}
 
+	// Errors the run recovered from are how an agent finds its way — a missing flag, a
+	// login it did not know about — and a run whose last tool call succeeded did go on
+	// past them. That is not evidence of success (nothing verified the result), so it
+	// is `unknown`; but calling it `failed` would keep exactly the runs that learned
+	// something out of every recipe.
+	const last = results.at(-1);
+	if (failed.length && last && !last.isError) {
+		return {
+			status: "unknown",
+			evidence: [
+				`${failed.length} tool error(s) recovered from — the last tool call succeeded, nothing verified it`,
+				...(last.command ? [`last: ${summarize(last.command)}`] : []),
+			],
+		};
+	}
+
 	if (failed.length) {
 		const tools = [...new Set(failed.map((result) => result.toolName))].slice(0, 3);
 		return {

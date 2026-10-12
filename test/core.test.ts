@@ -695,3 +695,12 @@ test("pi's compaction message is read back to its summary, and nothing else is",
 	assert.equal(compactionSummaryOf({ role: "compactionSummary", summary: "S" } as never), "S");
 	assert.equal(compactionSummaryOf({ role: "assistant", content: [] } as never), undefined);
 });
+
+test("a path inside the project is portable; one outside it is not", async () => {
+	const { isPortablePath } = await import("../src/redact.ts");
+	assert.equal(isPortablePath("./shipit"), true);
+	assert.equal(isPortablePath("src/main.py"), true);
+	assert.equal(isPortablePath("../elsewhere/tool"), false);
+	assert.equal(isPortablePath("/home/alice/tool"), false);
+	assert.equal(isPortablePath("~/bin/tool"), false);
+});

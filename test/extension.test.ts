@@ -1011,3 +1011,23 @@ test("outside a replay, compaction is none of pi-tape's business", async () => {
 	const compact = captured.handlers.get("session_before_compact") as (event: unknown, ctx: unknown) => unknown;
 	assert.equal(await compact({ preparation: {} }, {}), undefined);
 });
+
+test("/tape record takes --status, as the CLI does, instead of putting it in the name", async () => {
+	const { captured, dir } = prepare();
+	try {
+		const session = parseSession(buildFixture().text);
+		const handler = captured.commands.get("tape") as (args: string, ctx: unknown) => Promise<void>;
+		await handler("record deployed --status success", fakeCtx(dir, session.entries));
+		const tape = readTape(join(dir, "deployed.tape"));
+		assert.equal(tape.name, "deployed");
+		assert.equal(tape.outcome?.status, "success");
+		assert.equal(tape.outcome?.declared, true);
+
+		capturedNotices = [];
+		await handler("record other --status great", fakeCtx(dir, session.entries));
+		assert.match(capturedNotices.join("\n"), /--status expects success, failed or unknown/);
+		assert.equal(existsSync(join(dir, "other.tape")), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

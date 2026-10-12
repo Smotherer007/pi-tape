@@ -1065,7 +1065,19 @@ function recordCommand(args: string, ctx: ExtensionCommandContext): void {
 	}
 
 	const redact = /(^|\s)--redact(\s|$)/.test(args);
-	const name = args.replace(/(^|\s)--redact(\s|$)/, " ").trim() || undefined;
+	// `--status success|failed|unknown` declares how the run ended, as the CLI's
+	// `record --status` does. Without it the flag used to end up in the tape's name.
+	const statusMatch = /(^|\s)--status(?:=|\s+)(\S+)/.exec(args);
+	const declared = statusMatch?.[2];
+	if (declared !== undefined && declared !== "success" && declared !== "failed" && declared !== "unknown") {
+		ctx.ui.notify(`tape: --status expects success, failed or unknown, got "${declared}"`, "warning");
+		return;
+	}
+	const name =
+		args
+			.replace(/(^|\s)--redact(?=\s|$)/, " ")
+			.replace(/(^|\s)--status(?:=|\s+)\S+/, " ")
+			.trim() || undefined;
 
 	// Recording a session that ran as a fork makes the fork a tape in its own right.
 	// The link back is what lets `diff` say "this is that run with one value changed"
@@ -1087,7 +1099,13 @@ function recordCommand(args: string, ctx: ExtensionCommandContext): void {
 				reconnected: armed.fork.reconnected,
 			}
 		: undefined;
-	const result = recordSession(session, { name, piVersion: piVersion(), redact, parent });
+	const result = recordSession(session, {
+		name,
+		piVersion: piVersion(),
+		redact,
+		parent,
+		...(declared ? { status: declared as "success" | "failed" | "unknown" } : {}),
+	});
 	const out = join(ctx.cwd, `${slugify(result.tape.name ?? result.tape.id.slice(7, 19))}.tape`);
 
 	try {
